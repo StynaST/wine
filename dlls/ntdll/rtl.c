@@ -86,6 +86,23 @@ NTSTATUS WINAPI vDbgPrintEx( ULONG id, ULONG level, LPCSTR fmt, va_list args )
 }
 
 /******************************************************************************
+ *	NtQueryDebugFilterState  [NTDLL.@]
+ *	ZwQueryDebugFilterState  [NTDLL.@]
+ *	DbgQueryDebugFilterState  [NTDLL.@]
+ */
+NTSTATUS WINAPI NtQueryDebugFilterState( ULONG id, ULONG level )
+{
+    TRACE( "id %lu, level %#lx.\n", id, level );
+
+    /* without a kernel debugger no component filter masks are enabled */
+    return FALSE;
+}
+
+/* called through a volatile pointer, so the query is never folded away and
+ * hooks on the export take effect */
+static NTSTATUS (WINAPI * volatile query_debug_filter_state)( ULONG, ULONG ) = NtQueryDebugFilterState;
+
+/******************************************************************************
  *	vDbgPrintExWithPrefix  [NTDLL.@]
  */
 NTSTATUS WINAPI vDbgPrintExWithPrefix( LPCSTR prefix, ULONG id, ULONG level, LPCSTR fmt, va_list args )
@@ -100,7 +117,9 @@ NTSTATUS WINAPI vDbgPrintExWithPrefix( LPCSTR prefix, ULONG id, ULONG level, LPC
 
     WARN_(debugstr)(*end == '\n' ? "%08lx:%08lx: %s" : "%08lx:%08lx: %s\n", id, level_mask, buf);
 
-    if (level_mask & (1 << DPFLTR_ERROR_LEVEL) && NtCurrentTeb()->Peb->BeingDebugged)
+    /* applications may enable a component filter to capture these, e.g. loader errors */
+    if ((level_mask & (1 << DPFLTR_ERROR_LEVEL) && NtCurrentTeb()->Peb->BeingDebugged) ||
+        query_debug_filter_state( id, level ) == TRUE)
     {
         __TRY
         {
