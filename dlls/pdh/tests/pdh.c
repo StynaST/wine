@@ -24,6 +24,7 @@
 
 #include "pdh.h"
 #include "pdhmsg.h"
+#include "winperf.h"
 
 #include "wine/test.h"
 
@@ -1016,6 +1017,125 @@ static void test_PdhGetDllVersion(void)
     }
 }
 
+
+static void test_processor_utility(void)
+{
+    PDH_FMT_COUNTERVALUE value;
+    PDH_HCOUNTER counter;
+    PDH_HQUERY query;
+    PDH_STATUS ret;
+
+    ret = PdhOpenQueryW( NULL, 0, &query );
+    ok( ret == ERROR_SUCCESS, "PdhOpenQueryW failed 0x%08lx\n", ret );
+    ret = PdhAddEnglishCounterW( query, L"\\Processor Information(_Total)\\% Processor Utility", 0, &counter );
+    ok( ret == ERROR_SUCCESS, "PdhAddEnglishCounterW failed 0x%08lx\n", ret );
+    if (ret) goto done;
+
+    ret = PdhCollectQueryData( query );
+    ok( ret == ERROR_SUCCESS, "PdhCollectQueryData failed 0x%08lx\n", ret );
+    Sleep( 200 );
+    ret = PdhCollectQueryData( query );
+    ok( ret == ERROR_SUCCESS, "PdhCollectQueryData failed 0x%08lx\n", ret );
+
+    ret = PdhGetFormattedCounterValue( counter, PDH_FMT_DOUBLE | PDH_FMT_NOCAP100, NULL, &value );
+    ok( ret == ERROR_SUCCESS, "PdhGetFormattedCounterValue failed 0x%08lx\n", ret );
+    ok( value.doubleValue >= 0.0 && value.doubleValue <= 1000.0, "got %f\n", value.doubleValue );
+
+done:
+    PdhCloseQuery( query );
+}
+
+/* GPU counters as read by FiveM's performance overlay (DrawPerf.cpp) */
+static void test_gpu_counters(void)
+{
+    PDH_RAW_COUNTER_ITEM_W *items, *items2;
+    PDH_FMT_COUNTERVALUE value;
+    PDH_COUNTER_INFO_W *info;
+    PDH_HCOUNTER engine, memory;
+    DWORD size, count, count2, i;
+    PDH_HQUERY query;
+    PDH_STATUS ret;
+    BYTE buffer[4096];
+
+    ret = PdhOpenQueryW( NULL, 0, &query );
+    ok( ret == ERROR_SUCCESS, "PdhOpenQueryW failed 0x%08lx\n", ret );
+    ret = PdhAddEnglishCounterW( query, L"\\GPU Engine(*)\\Utilization Percentage", 0, &engine );
+    ok( ret == ERROR_SUCCESS, "PdhAddEnglishCounterW failed 0x%08lx\n", ret );
+    ret = PdhAddEnglishCounterW( query, L"\\GPU Adapter Memory(*)\\Dedicated Usage", 0, &memory );
+    ok( ret == ERROR_SUCCESS, "PdhAddEnglishCounterW failed 0x%08lx\n", ret );
+    if (ret) goto done;
+
+    size = sizeof(buffer);
+    info = (PDH_COUNTER_INFO_W *)buffer;
+    ret = PdhGetCounterInfoW( engine, FALSE, &size, info );
+    ok( ret == ERROR_SUCCESS, "PdhGetCounterInfoW failed 0x%08lx\n", ret );
+    ok( info->dwType == PERF_100NSEC_TIMER, "got type %#lx\n", info->dwType );
+    size = sizeof(buffer);
+    ret = PdhGetCounterInfoW( memory, FALSE, &size, info );
+    ok( ret == ERROR_SUCCESS, "PdhGetCounterInfoW failed 0x%08lx\n", ret );
+    ok( info->dwType == PERF_COUNTER_LARGE_RAWCOUNT, "got type %#lx\n", info->dwType );
+
+    ret = PdhCollectQueryData( query );
+    ok( ret == ERROR_SUCCESS, "PdhCollectQueryData failed 0x%08lx\n", ret );
+
+    size = count = 0;
+    ret = PdhGetRawCounterArrayW( engine, &size, &count, NULL );
+    ok( ret == PDH_MORE_DATA || (ret == ERROR_SUCCESS && !count), "PdhGetRawCounterArrayW failed 0x%08lx\n", ret );
+    if (!count)
+    {
+        skip( "no GPU engine instances\n" );
+        goto done;
+    }
+    ok( size > count * sizeof(*items), "got size %lu\n", size );
+    items = malloc( size );
+    ret = PdhGetRawCounterArrayW( engine, &size, &count, items );
+    ok( ret == ERROR_SUCCESS, "PdhGetRawCounterArrayW failed 0x%08lx\n", ret );
+    for (i = 0; i < count; i++)
+    {
+        ok( !wcsncmp( items[i].szName, L"pid_", 4 ), "got name %s\n", debugstr_w(items[i].szName) );
+        ok( wcsstr( items[i].szName, L"_luid_0x" ) != NULL, "got name %s\n", debugstr_w(items[i].szName) );
+        ok( items[i].RawValue.CStatus == PDH_CSTATUS_VALID_DATA, "got status %#lx\n", items[i].RawValue.CStatus );
+    }
+
+    Sleep( 100 );
+    ret = PdhCollectQueryData( query );
+    ok( ret == ERROR_SUCCESS, "PdhCollectQueryData failed 0x%08lx\n", ret );
+    size = count2 = 0;
+    PdhGetRawCounterArrayW( engine, &size, &count2, NULL );
+    items2 = malloc( size );
+    ret = PdhGetRawCounterArrayW( engine, &size, &count2, items2 );
+    ok( ret == ERROR_SUCCESS, "PdhGetRawCounterArrayW failed 0x%08lx\n", ret );
+    for (i = 0; i < min( count, count2 ); i++)
+    {
+        if (wcscmp( items[i].szName, items2[i].szName )) continue;
+        ret = PdhFormatFromRawValue( PERF_100NSEC_TIMER, PDH_FMT_DOUBLE, NULL,
+                                     &items2[i].RawValue, &items[i].RawValue, &value );
+        ok( ret == ERROR_SUCCESS, "PdhFormatFromRawValue failed 0x%08lx\n", ret );
+        ok( value.doubleValue >= 0.0 && value.doubleValue <= 100.0, "got %f\n", value.doubleValue );
+    }
+    free( items2 );
+    free( items );
+
+    size = count = 0;
+    ret = PdhGetRawCounterArrayW( memory, &size, &count, NULL );
+    ok( ret == PDH_MORE_DATA, "PdhGetRawCounterArrayW failed 0x%08lx\n", ret );
+    items = malloc( size );
+    ret = PdhGetRawCounterArrayW( memory, &size, &count, items );
+    ok( ret == ERROR_SUCCESS, "PdhGetRawCounterArrayW failed 0x%08lx\n", ret );
+    for (i = 0; i < count; i++)
+    {
+        ok( !wcsncmp( items[i].szName, L"luid_0x", 7 ), "got name %s\n", debugstr_w(items[i].szName) );
+        ret = PdhFormatFromRawValue( PERF_COUNTER_LARGE_RAWCOUNT, PDH_FMT_LARGE, NULL, &items[i].RawValue, NULL, &value );
+        ok( ret == ERROR_SUCCESS, "PdhFormatFromRawValue failed 0x%08lx\n", ret );
+        ok( value.largeValue == items[i].RawValue.FirstValue, "got %I64d\n", value.largeValue );
+    }
+    free( items );
+
+done:
+    PdhCloseQuery( query );
+}
+
+
 START_TEST(pdh)
 {
     if (!is_lang_english())
@@ -1041,6 +1161,8 @@ START_TEST(pdh)
     test_PdhGetCounterTimeBase();
 
     test_PdhVbGetDoubleCounterValue();
+    test_processor_utility();
+    test_gpu_counters();
 
     test_PdhGetCounterInfoA();
     test_PdhGetCounterInfoW();

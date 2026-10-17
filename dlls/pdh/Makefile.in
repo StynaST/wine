@@ -1,5 +1,6 @@
 MODULE    = pdh.dll
 IMPORTLIB = pdh
+IMPORTS   = gdi32
 
 EXTRADLLFLAGS = -Wb,--prefer-native
 

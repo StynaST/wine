@@ -23,8 +23,13 @@
 #include <stdlib.h>
 #include <math.h>
 
+#include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winbase.h"
+#include "wingdi.h"
+#include "winternl.h"
+#include "ddk/d3dkmthk.h"
 
 #include "pdh.h"
 #include "pdhmsg.h"
@@ -79,6 +84,15 @@ struct counter
     void (CALLBACK *collect)( struct counter * );   /* collect callback */
     union value     one;                            /* first value */
     union value     two;                            /* second value */
+    PDH_RAW_COUNTER raw[2];                         /* previous and current raw sample */
+    struct instance *instances;                     /* wildcard counter instances */
+    DWORD           instance_count;
+};
+
+struct instance
+{
+    WCHAR          *name;
+    PDH_RAW_COUNTER raw[2];                         /* previous and current raw sample */
 };
 
 #define PDH_MAGIC_COUNTER   0x50444831 /* 'PDH1' */
@@ -95,10 +109,19 @@ static struct counter *create_counter( void )
     return NULL;
 }
 
+static void free_instances( struct instance *instances, DWORD count )
+{
+    DWORD i;
+
+    for (i = 0; i < count; i++) free( instances[i].name );
+    free( instances );
+}
+
 static void destroy_counter( struct counter *counter )
 {
     /* Ensure compiler doesn't optimize out the assignment with 0. */
     SecureZeroMemory( &counter->magic, sizeof( counter->magic ) );
+    free_instances( counter->instances, counter->instance_count );
     free( counter->path );
     free( counter );
 }
@@ -146,10 +169,44 @@ struct source
     LONGLONG        base;                           /* samples per second */
 };
 
+static LONGLONG current_time(void)
+{
+    FILETIME ft;
+
+    GetSystemTimePreciseAsFileTime( &ft );
+    return ((LONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+}
+
+static void set_raw_value( PDH_RAW_COUNTER raw[2], LONGLONG first, LONGLONG second, LONGLONG time )
+{
+    raw[0] = raw[1];
+    raw[1].CStatus                  = PDH_CSTATUS_VALID_DATA;
+    raw[1].TimeStamp.dwLowDateTime  = time;
+    raw[1].TimeStamp.dwHighDateTime = time >> 32;
+    raw[1].FirstValue               = first;
+    raw[1].SecondValue              = second;
+    raw[1].MultiCount               = 1;
+}
+
+/* average idle time of all processors, in 100ns units */
 static void CALLBACK collect_processor_time( struct counter *counter )
 {
-    counter->two.largevalue = 500000; /* FIXME */
-    counter->status = PDH_CSTATUS_VALID_DATA;
+    SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION *info;
+    SYSTEM_BASIC_INFORMATION basic;
+    LONGLONG idle = 0, time = current_time();
+    ULONG i;
+
+    counter->status = PDH_CSTATUS_INVALID_DATA;
+    if (NtQuerySystemInformation( SystemBasicInformation, &basic, sizeof(basic), NULL )) return;
+    if (!(info = calloc( basic.NumberOfProcessors, sizeof(*info) ))) return;
+    if (!NtQuerySystemInformation( SystemProcessorPerformanceInformation, info,
+                                   basic.NumberOfProcessors * sizeof(*info), NULL ))
+    {
+        for (i = 0; i < basic.NumberOfProcessors; i++) idle += info[i].IdleTime.QuadPart;
+        set_raw_value( counter->raw, idle / basic.NumberOfProcessors, 0, time );
+        counter->status = PDH_CSTATUS_VALID_DATA;
+    }
+    free( info );
 }
 
 static void CALLBACK collect_uptime( struct counter *counter )
@@ -158,19 +215,123 @@ static void CALLBACK collect_uptime( struct counter *counter )
     counter->status = PDH_CSTATUS_VALID_DATA;
 }
 
-#define TYPE_PROCESSOR_TIME \
-    (PERF_SIZE_LARGE | PERF_TYPE_COUNTER | PERF_COUNTER_RATE | PERF_TIMER_100NS | PERF_DELTA_COUNTER | \
-     PERF_INVERSE_COUNTER | PERF_DISPLAY_PERCENT)
+static void update_instance( struct instance **instances, DWORD *count, struct instance *old, DWORD old_count,
+                             const WCHAR *name, LONGLONG first, LONGLONG time )
+{
+    struct instance *tmp, *inst;
+    DWORD i;
+
+    if (!(tmp = realloc( *instances, (*count + 1) * sizeof(**instances) ))) return;
+    *instances = tmp;
+    inst = &tmp[*count];
+    memset( inst, 0, sizeof(*inst) );
+    if (!(inst->name = wcsdup( name ))) return;
+    (*count)++;
+
+    for (i = 0; i < old_count; i++)
+    {
+        if (wcscmp( old[i].name, name )) continue;
+        inst->raw[1] = old[i].raw[1];
+        break;
+    }
+    set_raw_value( inst->raw, first, 0, time );
+}
+
+enum gpu_counter
+{
+    GPU_ENGINE_RUNNING_TIME,
+    GPU_ADAPTER_DEDICATED_USAGE,
+};
+
+static void collect_gpu( struct counter *counter, enum gpu_counter which )
+{
+    D3DKMT_ENUMADAPTERS2 enum_adapters = {0};
+    struct instance *instances = NULL;
+    D3DKMT_ADAPTERINFO *adapters;
+    LONGLONG time = current_time();
+    DWORD count = 0;
+    WCHAR name[96];
+    ULONG i;
+
+    counter->status = PDH_CSTATUS_INVALID_DATA;
+    if (D3DKMTEnumAdapters2( &enum_adapters )) return;
+    if (!(adapters = calloc( enum_adapters.NumAdapters, sizeof(*adapters) ))) return;
+    enum_adapters.pAdapters = adapters;
+    if (D3DKMTEnumAdapters2( &enum_adapters ))
+    {
+        free( adapters );
+        return;
+    }
+
+    for (i = 0; i < enum_adapters.NumAdapters; i++)
+    {
+        D3DKMT_QUERYSTATISTICS stats = {0};
+        D3DKMT_CLOSEADAPTER close = {adapters[i].hAdapter};
+        LUID luid = adapters[i].AdapterLuid;
+
+        D3DKMTCloseAdapter( &close );
+        stats.AdapterLuid = luid;
+
+        if (which == GPU_ENGINE_RUNNING_TIME)
+        {
+            stats.Type = D3DKMT_QUERYSTATISTICS_NODE;
+            stats.QueryNode.NodeId = 0;
+            if (D3DKMTQueryStatistics( &stats )) continue;
+            /* only system-wide engine time is known, report it for the calling process */
+            swprintf( name, ARRAY_SIZE(name), L"pid_%lu_luid_0x%08lX_0x%08lX_phys_0_eng_0_engtype_3D",
+                      GetCurrentProcessId(), luid.HighPart, luid.LowPart );
+            update_instance( &instances, &count, counter->instances, counter->instance_count, name,
+                             stats.QueryResult.NodeInformation.GlobalInformation.RunningTime.QuadPart, time );
+        }
+        else
+        {
+            stats.Type = D3DKMT_QUERYSTATISTICS_SEGMENT;
+            stats.QuerySegment.SegmentId = 0;
+            if (D3DKMTQueryStatistics( &stats )) continue;
+            swprintf( name, ARRAY_SIZE(name), L"luid_0x%08lX_0x%08lX_phys_0", luid.HighPart, luid.LowPart );
+            update_instance( &instances, &count, counter->instances, counter->instance_count, name,
+                             stats.QueryResult.SegmentInformation.BytesResident, time );
+        }
+    }
+    free( adapters );
+
+    free_instances( counter->instances, counter->instance_count );
+    counter->instances = instances;
+    counter->instance_count = count;
+    counter->status = PDH_CSTATUS_VALID_DATA;
+}
+
+static void CALLBACK collect_gpu_engine( struct counter *counter )
+{
+    collect_gpu( counter, GPU_ENGINE_RUNNING_TIME );
+}
+
+static void CALLBACK collect_gpu_memory( struct counter *counter )
+{
+    collect_gpu( counter, GPU_ADAPTER_DEDICATED_USAGE );
+}
+
+#define TYPE_PROCESSOR_TIME PERF_100NSEC_TIMER_INV
 
 #define TYPE_UPTIME \
     (PERF_SIZE_LARGE | PERF_TYPE_COUNTER | PERF_COUNTER_ELAPSED | PERF_OBJECT_TIMER | PERF_DISPLAY_SECONDS)
 
-/* counter source registry */
+/* counter source registry, index 0 means no registered name index */
 static const struct source counter_sources[] =
 {
-    { 6,   L"\\Processor(_Total)\\% Processor Time", collect_processor_time, TYPE_PROCESSOR_TIME, -5, 10000000 },
-    { 674, L"\\System\\System Up Time",              collect_uptime,         TYPE_UPTIME,         -3, 1000 }
+    { 6,   L"\\Processor(_Total)\\% Processor Time",                collect_processor_time, TYPE_PROCESSOR_TIME,         0, 10000000 },
+    { 674, L"\\System\\System Up Time",                              collect_uptime,         TYPE_UPTIME,                -3, 1000 },
+    { 0,   L"\\Processor Information(_Total)\\% Processor Time",    collect_processor_time, TYPE_PROCESSOR_TIME,         0, 10000000 },
+    { 0,   L"\\Processor Information(_Total)\\% Processor Utility", collect_processor_time, TYPE_PROCESSOR_TIME,         0, 10000000 },
+    { 0,   L"\\GPU Engine(*)\\Utilization Percentage",              collect_gpu_engine,     PERF_100NSEC_TIMER,          0, 10000000 },
+    { 0,   L"\\GPU Engine(*)\\Running Time",                        collect_gpu_engine,     PERF_COUNTER_LARGE_RAWCOUNT, 0, 10000000 },
+    { 0,   L"\\GPU Adapter Memory(*)\\Dedicated Usage",             collect_gpu_memory,     PERF_COUNTER_LARGE_RAWCOUNT, 0, 1 },
 };
+
+static BOOL is_wildcard_source( const struct counter *counter )
+{
+    return wcsstr( counter->path, L"(*)" ) != NULL;
+}
 
 static BOOL is_local_machine( const WCHAR *name, DWORD len )
 {
@@ -293,6 +454,63 @@ PDH_STATUS WINAPI PdhAddEnglishCounterW( PDH_HQUERY query, LPCWSTR path,
     return PdhAddCounterW( query, path, userdata, counter );
 }
 
+static LONGLONG raw_time( const PDH_RAW_COUNTER *raw )
+{
+    return ((LONGLONG)raw->TimeStamp.dwHighDateTime << 32) | raw->TimeStamp.dwLowDateTime;
+}
+
+/* compute a value from the current and previous raw samples of a counter type */
+static PDH_STATUS calculate_raw( DWORD type, DWORD format, LONG scale, const PDH_RAW_COUNTER *cur,
+                                 const PDH_RAW_COUNTER *prev, PDH_FMT_COUNTERVALUE *value )
+{
+    double result;
+    LONGLONG delta;
+
+    if (!cur || cur->CStatus != PDH_CSTATUS_VALID_DATA) return PDH_INVALID_DATA;
+
+    switch (type)
+    {
+    case PERF_COUNTER_RAWCOUNT:
+    case PERF_COUNTER_LARGE_RAWCOUNT:
+        result = cur->FirstValue;
+        break;
+
+    case PERF_100NSEC_TIMER:
+    case PERF_100NSEC_TIMER_INV:
+        if (!prev || prev->CStatus != PDH_CSTATUS_VALID_DATA) return PDH_INVALID_DATA;
+        if ((delta = raw_time( cur ) - raw_time( prev )) <= 0) return PDH_CALC_NEGATIVE_DENOMINATOR;
+        result = (double)(cur->FirstValue - prev->FirstValue) / delta;
+        if (type == PERF_100NSEC_TIMER_INV) result = 1.0 - result;
+        result *= 100.0;
+        if (result < 0.0) result = 0.0;
+        if (!(format & PDH_FMT_NOCAP100) && result > 100.0) result = 100.0;
+        break;
+
+    default:
+        FIXME( "counter type %#lx not supported\n", type );
+        return PDH_INVALID_ARGUMENT;
+    }
+
+    if (!(format & PDH_FMT_NOSCALE)) result *= pow( 10, scale );
+    if (format & PDH_FMT_1000) result *= 1000;
+
+    if (format & PDH_FMT_LONG) value->longValue = result;
+    else if (format & PDH_FMT_LARGE) value->largeValue = result;
+    else if (format & PDH_FMT_DOUBLE) value->doubleValue = result;
+    else
+    {
+        WARN( "unknown format %lx\n", format );
+        return PDH_INVALID_ARGUMENT;
+    }
+    value->CStatus = ERROR_SUCCESS;
+    return ERROR_SUCCESS;
+}
+
+static BOOL uses_raw_samples( const struct counter *counter )
+{
+    return counter->type != TYPE_UPTIME;
+}
+
 /* caller must hold counter lock */
 static PDH_STATUS format_value( struct counter *counter, DWORD format, union value *raw1,
                                 union value *raw2, PDH_FMT_COUNTERVALUE *value )
@@ -344,8 +562,12 @@ PDH_STATUS WINAPI PdhCalculateCounterFromRawValue( PDH_HCOUNTER handle, DWORD fo
         return PDH_INVALID_HANDLE;
     }
 
-    ret = format_value( counter, format, (union value *)&raw1->SecondValue,
-                                         (union value *)&raw2->SecondValue, value );
+    if (uses_raw_samples( counter ))
+        ret = calculate_raw( counter->type, format, counter->scale ? counter->scale : counter->defaultscale,
+                             raw1, raw2, value );
+    else
+        ret = format_value( counter, format, (union value *)&raw1->SecondValue,
+                                             (union value *)&raw2->SecondValue, value );
 
     LeaveCriticalSection( &pdh_handle_cs );
     return ret;
@@ -751,7 +973,14 @@ PDH_STATUS WINAPI PdhGetFormattedCounterValue( PDH_HCOUNTER handle, DWORD format
         LeaveCriticalSection( &pdh_handle_cs );
         return PDH_INVALID_DATA;
     }
-    if (!(ret = format_value( counter, format, &counter->one, &counter->two, value )))
+    if (uses_raw_samples( counter ))
+    {
+        if (is_wildcard_source( counter )) ret = PDH_INVALID_HANDLE;
+        else ret = calculate_raw( counter->type, format, counter->scale ? counter->scale : counter->defaultscale,
+                                  &counter->raw[1], &counter->raw[0], value );
+        if (!ret && type) *type = counter->type;
+    }
+    else if (!(ret = format_value( counter, format, &counter->one, &counter->two, value )))
     {
         value->CStatus = ERROR_SUCCESS;
         if (type) *type = counter->type;
@@ -780,12 +1009,19 @@ PDH_STATUS WINAPI PdhGetRawCounterValue( PDH_HCOUNTER handle, LPDWORD type,
         return PDH_INVALID_HANDLE;
     }
 
-    value->CStatus                  = counter->status;
-    value->TimeStamp.dwLowDateTime  = counter->stamp.dwLowDateTime;
-    value->TimeStamp.dwHighDateTime = counter->stamp.dwHighDateTime;
-    value->FirstValue               = counter->one.largevalue;
-    value->SecondValue              = counter->two.largevalue;
-    value->MultiCount               = 1; /* FIXME */
+    if (uses_raw_samples( counter ) && counter->raw[1].CStatus == PDH_CSTATUS_VALID_DATA)
+    {
+        *value = counter->raw[1];
+    }
+    else
+    {
+        value->CStatus                  = counter->status;
+        value->TimeStamp.dwLowDateTime  = counter->stamp.dwLowDateTime;
+        value->TimeStamp.dwHighDateTime = counter->stamp.dwHighDateTime;
+        value->FirstValue               = counter->one.largevalue;
+        value->SecondValue              = counter->two.largevalue;
+        value->MultiCount               = 1; /* FIXME */
+    }
 
     if (type) *type = counter->type;
 
@@ -793,24 +1029,157 @@ PDH_STATUS WINAPI PdhGetRawCounterValue( PDH_HCOUNTER handle, LPDWORD type,
     return ERROR_SUCCESS;
 }
 
-PDH_STATUS WINAPI PdhGetFormattedCounterArrayW( PDH_HCOUNTER handle, DWORD format, DWORD *size, DWORD *count,
-                                                PDH_FMT_COUNTERVALUE_ITEM_W *buffer)
+/* caller must hold counter lock */
+static DWORD counter_item_count( const struct counter *counter )
 {
-    FIXME( "%p %lu %p %p %p stub.\n", handle, format, size, count, buffer );
+    return is_wildcard_source( counter ) ? counter->instance_count : 1;
+}
 
-    *size = 0;
-    *count = 0;
+/* caller must hold counter lock; name is the instance part of a non-wildcard path */
+static void counter_item( struct counter *counter, DWORD i, const WCHAR **name, DWORD *name_len,
+                          PDH_RAW_COUNTER **cur, PDH_RAW_COUNTER **prev )
+{
+    if (is_wildcard_source( counter ))
+    {
+        *name = counter->instances[i].name;
+        *name_len = wcslen( *name );
+        *cur = &counter->instances[i].raw[1];
+        *prev = &counter->instances[i].raw[0];
+    }
+    else
+    {
+        const WCHAR *start = wcschr( counter->path, '(' ), *end = start ? wcschr( start, ')' ) : NULL;
+
+        *name = start && end ? start + 1 : L"";
+        *name_len = start && end ? end - start - 1 : 0;
+        *cur = &counter->raw[1];
+        *prev = &counter->raw[0];
+    }
+}
+
+static PDH_STATUS get_counter_array( PDH_HCOUNTER handle, BOOL formatted, DWORD format, BOOL ansi,
+                                     DWORD *size, DWORD *count, void *buffer )
+{
+    struct counter *counter = handle;
+    DWORD i, n, item_size, required, name_len;
+    PDH_RAW_COUNTER *cur, *prev;
+    const WCHAR *name;
+    char *strings;
+
+    if (!size || !count) return PDH_INVALID_ARGUMENT;
+
+    EnterCriticalSection( &pdh_handle_cs );
+    if (!counter || counter->magic != PDH_MAGIC_COUNTER)
+    {
+        LeaveCriticalSection( &pdh_handle_cs );
+        return PDH_INVALID_HANDLE;
+    }
+    if (!uses_raw_samples( counter ))
+    {
+        LeaveCriticalSection( &pdh_handle_cs );
+        FIXME( "array of %s not supported\n", debugstr_w(counter->path) );
+        return PDH_NOT_IMPLEMENTED;
+    }
+
+    item_size = formatted ? (ansi ? sizeof(PDH_FMT_COUNTERVALUE_ITEM_A) : sizeof(PDH_FMT_COUNTERVALUE_ITEM_W))
+                          : (ansi ? sizeof(PDH_RAW_COUNTER_ITEM_A) : sizeof(PDH_RAW_COUNTER_ITEM_W));
+    n = counter_item_count( counter );
+    required = n * item_size;
+    for (i = 0; i < n; i++)
+    {
+        counter_item( counter, i, &name, &name_len, &cur, &prev );
+        required += ansi ? WideCharToMultiByte( CP_ACP, 0, name, name_len, NULL, 0, NULL, NULL ) + 1
+                         : (name_len + 1) * sizeof(WCHAR);
+    }
+
+    *count = n;
+    if (!buffer || *size < required)
+    {
+        *size = required;
+        LeaveCriticalSection( &pdh_handle_cs );
+        return PDH_MORE_DATA;
+    }
+    *size = required;
+
+    strings = (char *)buffer + n * item_size;
+    for (i = 0; i < n; i++)
+    {
+        char *item = (char *)buffer + i * item_size;
+        char *str = strings;
+
+        counter_item( counter, i, &name, &name_len, &cur, &prev );
+        if (ansi)
+        {
+            int len = WideCharToMultiByte( CP_ACP, 0, name, name_len, str, required, NULL, NULL );
+            str[len] = 0;
+            strings += len + 1;
+        }
+        else
+        {
+            memcpy( str, name, name_len * sizeof(WCHAR) );
+            ((WCHAR *)str)[name_len] = 0;
+            strings += (name_len + 1) * sizeof(WCHAR);
+        }
+
+        if (formatted)
+        {
+            PDH_FMT_COUNTERVALUE *value = ansi ? &((PDH_FMT_COUNTERVALUE_ITEM_A *)item)->FmtValue
+                                               : &((PDH_FMT_COUNTERVALUE_ITEM_W *)item)->FmtValue;
+            PDH_STATUS status;
+
+            memset( value, 0, sizeof(*value) );
+            status = calculate_raw( counter->type, format, counter->scale ? counter->scale : counter->defaultscale,
+                                    cur, prev, value );
+            if (status) value->CStatus = status;
+            if (ansi) ((PDH_FMT_COUNTERVALUE_ITEM_A *)item)->szName = str;
+            else ((PDH_FMT_COUNTERVALUE_ITEM_W *)item)->szName = (WCHAR *)str;
+        }
+        else if (ansi)
+        {
+            ((PDH_RAW_COUNTER_ITEM_A *)item)->szName = str;
+            ((PDH_RAW_COUNTER_ITEM_A *)item)->RawValue = *cur;
+        }
+        else
+        {
+            ((PDH_RAW_COUNTER_ITEM_W *)item)->szName = (WCHAR *)str;
+            ((PDH_RAW_COUNTER_ITEM_W *)item)->RawValue = *cur;
+        }
+    }
+
+    LeaveCriticalSection( &pdh_handle_cs );
     return ERROR_SUCCESS;
 }
 
-PDH_STATUS WINAPI PdhGetFormattedCounterArrayA( PDH_HCOUNTER handle, DWORD format, DWORD *size, DWORD *count,
-                                                PDH_FMT_COUNTERVALUE_ITEM_A *buffer)
+/***********************************************************************
+ *              PdhGetFormattedCounterArrayW   (PDH.@)
+ */
+PDH_STATUS WINAPI PdhGetFormattedCounterArrayW( PDH_HCOUNTER handle, DWORD format, DWORD *size, DWORD *count,
+                                                PDH_FMT_COUNTERVALUE_ITEM_W *buffer )
 {
-    FIXME( "%p %lu %p %p %p stub.\n", handle, format, size, count, buffer );
+    TRACE( "%p %lx %p %p %p\n", handle, format, size, count, buffer );
+    return get_counter_array( handle, TRUE, format, FALSE, size, count, buffer );
+}
 
-    *size = 0;
-    *count = 0;
-    return ERROR_SUCCESS;
+/***********************************************************************
+ *              PdhGetFormattedCounterArrayA   (PDH.@)
+ */
+PDH_STATUS WINAPI PdhGetFormattedCounterArrayA( PDH_HCOUNTER handle, DWORD format, DWORD *size, DWORD *count,
+                                                PDH_FMT_COUNTERVALUE_ITEM_A *buffer )
+{
+    TRACE( "%p %lx %p %p %p\n", handle, format, size, count, buffer );
+    return get_counter_array( handle, TRUE, format, TRUE, size, count, buffer );
+}
+
+/***********************************************************************
+ *              PdhFormatFromRawValue   (PDH.@)
+ */
+PDH_STATUS WINAPI PdhFormatFromRawValue( DWORD type, DWORD format, LONGLONG *timebase,
+                                         PDH_RAW_COUNTER *raw1, PDH_RAW_COUNTER *raw2, PDH_FMT_COUNTERVALUE *value )
+{
+    TRACE( "%#lx %#lx %p %p %p %p\n", type, format, timebase, raw1, raw2, value );
+
+    if (!value) return PDH_INVALID_ARGUMENT;
+    return calculate_raw( type, format, 0, raw1, raw2, value );
 }
 
 /***********************************************************************
@@ -1333,17 +1702,17 @@ PDH_STATUS WINAPI PdhEnumObjectsW(const WCHAR *source, const WCHAR *machine, WCH
 /***********************************************************************
  *              PdhGetRawCounterArrayA   (PDH.@)
  */
-PDH_STATUS WINAPI PdhGetRawCounterArrayA(PDH_HCOUNTER counter, DWORD *size, DWORD *count, PDH_RAW_COUNTER_ITEM_A *buffer)
+PDH_STATUS WINAPI PdhGetRawCounterArrayA( PDH_HCOUNTER counter, DWORD *size, DWORD *count, PDH_RAW_COUNTER_ITEM_A *buffer )
 {
-    FIXME("%p %p %p %p: stub\n", counter, size, count, buffer);
-    return PDH_NOT_IMPLEMENTED;
+    TRACE( "%p %p %p %p\n", counter, size, count, buffer );
+    return get_counter_array( counter, FALSE, 0, TRUE, size, count, buffer );
 }
 
 /***********************************************************************
  *              PdhGetRawCounterArrayW   (PDH.@)
  */
-PDH_STATUS WINAPI PdhGetRawCounterArrayW(PDH_HCOUNTER counter, DWORD *size, DWORD *count, PDH_RAW_COUNTER_ITEM_W *buffer)
+PDH_STATUS WINAPI PdhGetRawCounterArrayW( PDH_HCOUNTER counter, DWORD *size, DWORD *count, PDH_RAW_COUNTER_ITEM_W *buffer )
 {
-    FIXME("%p %p %p %p: stub\n", counter, size, count, buffer);
-    return PDH_NOT_IMPLEMENTED;
+    TRACE( "%p %p %p %p\n", counter, size, count, buffer );
+    return get_counter_array( counter, FALSE, 0, FALSE, size, count, buffer );
 }

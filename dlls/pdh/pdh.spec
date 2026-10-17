@@ -42,7 +42,7 @@
 @ stub PdhExpandWildCardPathHA
 @ stub PdhExpandWildCardPathHW
 @ stdcall PdhExpandWildCardPathW(wstr wstr ptr ptr long)
-@ stub PdhFormatFromRawValue
+@ stdcall PdhFormatFromRawValue(long long ptr ptr ptr ptr)
 @ stdcall PdhGetCounterInfoA(ptr long ptr ptr)
 @ stdcall PdhGetCounterInfoW(ptr long ptr ptr)
 @ stdcall PdhGetCounterTimeBase(ptr ptr)
