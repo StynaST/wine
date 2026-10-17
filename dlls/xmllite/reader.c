@@ -920,6 +920,11 @@ static HRESULT readerinput_detectencoding(xmlreaderinput *readerinput, xml_encod
         buffer->cur += sizeof(utf16lebom);
         *enc = XmlEncoding_UTF16;
     }
+    /* no BOM and no markup at the very start, e.g. leading whitespace */
+    else if (buffer->data[0] && !buffer->data[1])
+        *enc = XmlEncoding_UTF16;
+    else
+        *enc = XmlEncoding_UTF8;
 
     return S_OK;
 }

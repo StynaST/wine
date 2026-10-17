@@ -2179,6 +2179,7 @@ static void test_encoding_detection(void)
         { { '<','!','-','-',' ','c','-','-','>',0 } },
         { { 0xfeff,'<','a','/','>',0 } },
         { { '<','a','/','>',0 } },
+        { { '\n','<','a','/','>',0 } },
     };
     static const char *encoding_testsA[] =
     {
@@ -2186,6 +2187,8 @@ static void test_encoding_detection(void)
         "<!-- comment -->",
         "\xef\xbb\xbf<a/>", /* UTF-8 BOM */
         "<a/>",
+        "\n<a/>", /* leading whitespace, no BOM or declaration */
+        " \t\r\n<a/>",
     };
     IXmlReader *reader;
     XmlNodeType type;
@@ -2222,6 +2225,10 @@ static void test_encoding_detection(void)
 
         IStream_Release(stream);
     }
+
+    set_input_string(reader, "\n<a/>");
+    read_node(reader, XmlNodeType_Whitespace);
+    read_node(reader, XmlNodeType_Element);
 
     IXmlReader_Release(reader);
 }
