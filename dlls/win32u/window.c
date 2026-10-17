@@ -6129,15 +6129,16 @@ static void style_fixup_workarounds( CREATESTRUCTW *cs, const UNICODE_STRING *cl
     const char *sgi = getenv( "SteamGameId" );
     unsigned int i;
 
-    if (class_name->Buffer == (LPCWSTR)DESKTOP_CLASS_ATOM) return;
+    /* the desktop process may not have a display driver yet, don't load it from here */
+    if (is_desktop_class( (UNICODE_STRING *)class_name ) || is_message_class( (UNICODE_STRING *)class_name )) return;
 
     for (i = 0; i < ARRAY_SIZE(workarounds); ++i)
     {
-        if ((!workarounds[i].wm || user_driver->pHasWindowManager( workarounds[i].wm ))
-            && (!workarounds[i].game_id || (sgi && !strcmp( sgi, workarounds[i].game_id )))
-            && (!workarounds[i].class_name ||
+        if ((!workarounds[i].class_name ||
                  (class_name->Length == wcslen( workarounds[i].class_name ) * sizeof(WCHAR)
-                 && !memcmp( class_name->Buffer, workarounds[i].class_name, class_name->Length ))))
+                 && !memcmp( class_name->Buffer, workarounds[i].class_name, class_name->Length )))
+            && (!workarounds[i].game_id || (sgi && !strcmp( sgi, workarounds[i].game_id )))
+            && (!workarounds[i].wm || user_driver->pHasWindowManager( workarounds[i].wm )))
         {
             FIXME( "HACK: %#x/%#x for %s.\n", workarounds[i].set_exstyle, workarounds[i].clear_exstyle, debugstr_us(class_name) );
             cs->dwExStyle |= workarounds[i].set_exstyle;
