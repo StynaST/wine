@@ -39,6 +39,36 @@
 #include "ddk/wdm.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(module);
+
+/* Windows 10 builds 18362 to 19045 keep the loader debug flags 16 bytes
+ * before the _fltused data export; applications enable loader error
+ * reporting through that address (FiveM's HardErrorScope). */
+__ASM_BLOCK_BEGIN(ldr_debug_flags)
+asm( ".data\n\t"
+     ".balign 16\n"
+     __ASM_GLOBL(__ASM_NAME("LdrpDebugFlags")) "\n\t"
+     ".long 0, 0, 0, 0\n"
+     __ASM_GLOBL(__ASM_NAME("ntdll_fltused")) "\n\t"
+     ".long 0x9875\n\t"
+     ".text" );
+__ASM_BLOCK_END
+
+extern ULONG LdrpDebugFlags;
+
+#define LDR_DEBUG_SHOW_ERRORS 0x2
+#define DPFLTR_LDR_ID 85
+
+/* report loader errors through DbgPrintEx like the Windows loader does */
+static void WINAPIV ldr_report_error( const char *fmt, ... )
+{
+    va_list args;
+
+    if (!(LdrpDebugFlags & LDR_DEBUG_SHOW_ERRORS)) return;
+    va_start( args, fmt );
+    vDbgPrintExWithPrefix( "LDR: ", DPFLTR_LDR_ID, DPFLTR_ERROR_LEVEL, fmt, args );
+    va_end( args );
+}
+
 WINE_DECLARE_DEBUG_CHANNEL(relay);
 WINE_DECLARE_DEBUG_CHANNEL(snoop);
 WINE_DECLARE_DEBUG_CHANNEL(loaddll);
@@ -1231,6 +1261,8 @@ static BOOL import_dll( WINE_MODREF *wm, const IMAGE_IMPORT_DESCRIPTOR *descr, L
         else
             ERR("Loading library %s (which is needed by %s) failed (error %lx).\n",
                 name, debugstr_w(wm->ldr.FullDllName.Buffer), status);
+        ldr_report_error( "Unable to load DLL \"%s\" needed by \"%ls\", status 0x%08lx\n",
+                          name, wm->ldr.FullDllName.Buffer, status );
         return FALSE;
     }
 

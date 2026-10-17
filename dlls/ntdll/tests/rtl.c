@@ -3579,6 +3579,23 @@ static void test_DbgPrint(void)
     RtlRemoveVectoredExceptionHandler( handler );
 }
 
+static void test_fltused(void)
+{
+    MEMORY_BASIC_INFORMATION info;
+    int *fltused;
+    SIZE_T size;
+
+    /* a data export; some applications also write next to it */
+    fltused = (int *)GetProcAddress( hntdll, "_fltused" );
+    ok( fltused != NULL, "_fltused not exported\n" );
+    if (!fltused) return;
+    ok( *fltused == 0x9875, "got %#x\n", *fltused );
+
+    size = VirtualQuery( fltused - 4, &info, sizeof(info) );
+    ok( size == sizeof(info), "VirtualQuery failed\n" );
+    ok( info.Protect == PAGE_READWRITE || info.Protect == PAGE_WRITECOPY, "got protection %#lx\n", info.Protect );
+}
+
 static BOOL test_heap_destroy_dbgstr = FALSE;
 static BOOL test_heap_destroy_break = FALSE;
 
@@ -5581,6 +5598,7 @@ START_TEST(rtl)
     test_RtlMakeSelfRelativeSD();
     test_LdrRegisterDllNotification();
     test_DbgPrint();
+    test_fltused();
     test_RtlDestroyHeap();
     test_RtlCreateHeap();
     test_RtlFirstFreeAce();
