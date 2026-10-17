@@ -4033,6 +4033,100 @@ static void test_dynamic_unwind(void)
     }
 }
 
+
+#if defined(__x86_64__) && !defined(__arm64ec__)
+
+struct function_table_data
+{
+    ULONG_PTR table;
+    ULONG_PTR base;
+    ULONG     image_size;
+    ULONG     size;
+};
+
+static RUNTIME_FUNCTION *hooked_table;
+static ULONG_PTR hooked_start, hooked_end;
+static int hooked_calls;
+
+static void * WINAPI lookup_table_override( ULONG_PTR pc, struct function_table_data *data )
+{
+    hooked_calls++;
+    memset( data, 0, sizeof(*data) );
+    if (pc < hooked_start || pc >= hooked_end) return NULL;
+    data->table = (ULONG_PTR)hooked_table;
+    data->base = hooked_start;
+    data->image_size = hooked_end - hooked_start;
+    data->size = sizeof(*hooked_table);
+    return hooked_table;
+}
+
+/* Applications that map executables themselves (FiveM) find the internal table
+ * lookup as the only direct call in RtlLookupFunctionTable and hook it. */
+static void test_lookup_function_table_hook(void)
+{
+    static const BYTE ret_code[] = {0xc3};
+    static const BYTE unwind_info[] = {1, 0, 0, 0};
+    BYTE *func = (BYTE *)pRtlLookupFunctionTable, *target = NULL, saved[12], patch[12];
+    IMAGE_NT_HEADERS *nt = RtlImageNtHeader( ntdll );
+    ULONG_PTR base, pc, ntdll_end = (ULONG_PTR)ntdll + nt->OptionalHeader.SizeOfImage;
+    RUNTIME_FUNCTION *entry, *rf;
+    DWORD old_prot;
+    int i, calls = 0;
+
+    if (!pRtlLookupFunctionTable || !pRtlLookupFunctionEntry)
+    {
+        win_skip( "RtlLookupFunctionTable not available\n" );
+        return;
+    }
+
+    for (i = 0; i < 64 && func[i] != 0xc3; i++)
+    {
+        BYTE *dest;
+        if (func[i] != 0xe8) continue;
+        dest = func + i + 5 + *(int *)(func + i + 1);
+        if ((ULONG_PTR)dest < (ULONG_PTR)ntdll || (ULONG_PTR)dest >= ntdll_end) continue;
+        target = dest;
+        calls++;
+        i += 4;
+    }
+    ok( calls == 1, "found %u direct calls\n", calls );
+    if (calls != 1) return;
+
+    rf = (RUNTIME_FUNCTION *)((char *)code_mem + 0x2000);
+    memcpy( (char *)code_mem + 0x2100, ret_code, sizeof(ret_code) );
+    memcpy( (char *)code_mem + 0x2200, unwind_info, sizeof(unwind_info) );
+    rf->BeginAddress = 0x2100;
+    rf->EndAddress = 0x2101;
+    rf->UnwindData = 0x2200;
+    hooked_table = rf;
+    hooked_start = (ULONG_PTR)code_mem;
+    hooked_end = hooked_start + 0x3000;
+    hooked_calls = 0;
+    pc = hooked_start + 0x2100;
+
+    /* mov rax, imm64; jmp rax */
+    patch[0] = 0x48; patch[1] = 0xb8;
+    *(void **)(patch + 2) = lookup_table_override;
+    patch[10] = 0xff; patch[11] = 0xe0;
+    memcpy( saved, target, sizeof(saved) );
+    VirtualProtect( target, sizeof(patch), PAGE_EXECUTE_READWRITE, &old_prot );
+    memcpy( target, patch, sizeof(patch) );
+    FlushInstructionCache( GetCurrentProcess(), target, sizeof(patch) );
+
+    base = 0xdeadbeef;
+    entry = pRtlLookupFunctionEntry( pc, &base, NULL );
+
+    memcpy( target, saved, sizeof(saved) );
+    VirtualProtect( target, sizeof(patch), old_prot, &old_prot );
+    FlushInstructionCache( GetCurrentProcess(), target, sizeof(patch) );
+
+    ok( hooked_calls > 0, "override not called\n" );
+    ok( entry == rf, "got entry %p, expected %p\n", entry, rf );
+    ok( base == hooked_start, "got base %Ix, expected %Ix\n", base, hooked_start );
+}
+
+#endif
+
 static void test_exception_directory(void)
 {
     ULONG len, exc_dir_size, old, saved_size, saved_address;
@@ -4110,6 +4204,9 @@ START_TEST(unwind)
 
     test_dynamic_unwind();
     test_exception_directory();
+#if defined(__x86_64__) && !defined(__arm64ec__)
+    test_lookup_function_table_hook();
+#endif
 }
 
 #else  /* !__i386__ */

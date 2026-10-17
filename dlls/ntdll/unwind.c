@@ -341,26 +341,104 @@ BOOLEAN CDECL RtlDeleteFunctionTable( RUNTIME_FUNCTION *table )
 }
 
 
-/**********************************************************************
- *              RtlLookupFunctionTable   (NTDLL.@)
+/* FUNCTION_TABLE_DATA filled by RtlpxLookupFunctionTable */
+struct function_table_data
+{
+    ULONG_PTR table;
+    ULONG_PTR base;
+    ULONG     image_size;
+    ULONG     size;
+};
+C_ASSERT( offsetof(struct function_table_data, base) == sizeof(void *) );
+
+void * WINAPI RtlpxLookupFunctionTable( ULONG_PTR pc, struct function_table_data *data );
+
+/***********************************************************************
+ *              RtlpxLookupFunctionTable
+ *
+ * Internal lookup shared by RtlLookupFunctionTable and RtlLookupFunctionEntry.
+ * Applications that map images manually hook it to provide their tables.
  */
-PRUNTIME_FUNCTION WINAPI RtlLookupFunctionTable( ULONG_PTR pc, ULONG_PTR *base, ULONG *len )
+void * DECLSPEC_NOINLINE WINAPI RtlpxLookupFunctionTable( ULONG_PTR pc, struct function_table_data *data )
 {
     LDR_DATA_TABLE_ENTRY *module;
+    ULONG size = 0;
+    void *table;
 
+    memset( data, 0, sizeof(*data) );
     if (LdrFindEntryForAddress( (void *)pc, &module )) return NULL;
-    *base = (ULONG_PTR)module->DllBase;
+    data->base = (ULONG_PTR)module->DllBase;
+    data->image_size = module->SizeOfImage;
 #ifdef __arm64ec__
     if (RtlIsEcCode( pc ))
     {
         IMAGE_ARM64EC_METADATA *metadata = arm64ec_get_module_metadata( module->DllBase );
         if (!metadata) return NULL;
-        *len = metadata->ExtraRFETableSize;
-        return (RUNTIME_FUNCTION *)(*base + metadata->ExtraRFETable);
+        data->size = metadata->ExtraRFETableSize;
+        data->table = data->base + metadata->ExtraRFETable;
+        return (void *)data->table;
     }
 #endif
-    return RtlImageDirectoryEntryToData( module->DllBase, TRUE, IMAGE_DIRECTORY_ENTRY_EXCEPTION, len );
+    table = RtlImageDirectoryEntryToData( module->DllBase, TRUE, IMAGE_DIRECTORY_ENTRY_EXCEPTION, &size );
+    data->table = (ULONG_PTR)table;
+    data->size = size;
+    return table;
 }
+
+
+/**********************************************************************
+ *              RtlLookupFunctionTable   (NTDLL.@)
+ */
+#if defined(__x86_64__) && !defined(__arm64ec__)
+C_ASSERT( offsetof(struct function_table_data, base) == 0x08 );
+C_ASSERT( offsetof(struct function_table_data, size) == 0x14 );
+/* Like on Windows 8.1 and later, this makes exactly one direct call, to
+ * RtlpxLookupFunctionTable; applications locate it by disassembling here. */
+__ASM_GLOBAL_FUNC( RtlLookupFunctionTable,
+                   "pushq %rsi\n\t"
+                   __ASM_SEH(".seh_pushreg %rsi\n\t")
+                   __ASM_CFI(".cfi_adjust_cfa_offset 8\n\t")
+                   __ASM_CFI(".cfi_rel_offset %rsi,0\n\t")
+                   "pushq %rdi\n\t"
+                   __ASM_SEH(".seh_pushreg %rdi\n\t")
+                   __ASM_CFI(".cfi_adjust_cfa_offset 8\n\t")
+                   __ASM_CFI(".cfi_rel_offset %rdi,0\n\t")
+                   "subq $0x48,%rsp\n\t"
+                   __ASM_SEH(".seh_stackalloc 0x48\n\t")
+                   __ASM_SEH(".seh_endprologue\n\t")
+                   __ASM_CFI(".cfi_adjust_cfa_offset 0x48\n\t")
+                   "movq %rdx,%rsi\n\t"           /* base */
+                   "movq %r8,%rdi\n\t"            /* len */
+                   "leaq 0x20(%rsp),%rdx\n\t"     /* struct function_table_data */
+                   "call " __ASM_NAME("RtlpxLookupFunctionTable") "\n\t"
+                   "movq 0x28(%rsp),%rcx\n\t"     /* data.base */
+                   "testq %rcx,%rcx\n\t"          /* outputs untouched without a module */
+                   "jz 1f\n\t"
+                   "movq %rcx,(%rsi)\n\t"
+                   "movl 0x34(%rsp),%ecx\n\t"     /* data.size */
+                   "movl %ecx,(%rdi)\n"
+                   "1:\taddq $0x48,%rsp\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset -0x48\n\t")
+                   "popq %rdi\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
+                   __ASM_CFI(".cfi_same_value %rdi\n\t")
+                   "popq %rsi\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
+                   __ASM_CFI(".cfi_same_value %rsi\n\t")
+                   "ret\n\t"
+                   "int3" )
+#else
+PRUNTIME_FUNCTION WINAPI RtlLookupFunctionTable( ULONG_PTR pc, ULONG_PTR *base, ULONG *len )
+{
+    struct function_table_data data;
+    void *table = RtlpxLookupFunctionTable( pc, &data );
+
+    if (!data.base) return NULL;
+    *base = data.base;
+    *len = data.size;
+    return table;
+}
+#endif
 
 
 /***********************************************************************
