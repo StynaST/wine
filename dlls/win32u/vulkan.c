@@ -1935,7 +1935,11 @@ static VkResult win32u_vkAllocateMemory( VkDevice client_device, const VkMemoryA
             HANDLE shared = import_win32->handle;
             if (import_win32->name && !(shared = open_shared_resource_from_name( import_win32->name ))) break;
             memory->local = d3dkmt_open_resource( 0, shared, &memory->mutex, &memory->sync );
-            if (shared && shared != import_win32->handle) NtClose( shared );
+            /* keep a reference so that the memory can be exported again */
+            if (shared == import_win32->handle)
+                NtDuplicateObject( NtCurrentProcess(), shared, NtCurrentProcess(), &memory->shared, 0, 0,
+                                   DUPLICATE_SAME_ATTRIBUTES | DUPLICATE_SAME_ACCESS );
+            else memory->shared = shared;
             break;
         }
         default:
@@ -2079,7 +2083,12 @@ static VkResult win32u_vkGetMemoryWin32HandleKHR( VkDevice client_device, const 
     case VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT:
     case VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT:
     case VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT:
-        NtDuplicateObject( NtCurrentProcess(), memory->shared, NtCurrentProcess(), handle, 0, 0, DUPLICATE_SAME_ATTRIBUTES | DUPLICATE_SAME_ACCESS );
+        if (!memory->shared || NtDuplicateObject( NtCurrentProcess(), memory->shared, NtCurrentProcess(), handle, 0, 0,
+                                                  DUPLICATE_SAME_ATTRIBUTES | DUPLICATE_SAME_ACCESS ))
+        {
+            WARN( "Memory %p has no NT shared handle\n", memory );
+            return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+        }
         TRACE( "Returning NT shared handle %p -> %p\n", memory->shared, *handle );
         return VK_SUCCESS;
 
