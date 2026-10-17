@@ -197,7 +197,8 @@ static void write_runtimeclasses_registry( const statement_list_t *stmts )
         if (stmt->type != STMT_TYPE && stmt->type != STMT_TYPEREF) continue;
         if (stmt->type == STMT_TYPEREF && strcmp( stmt->where.input_name, input_name )) continue; /* ignore #included statements */
         if (type_get_type((type = stmt->u.type)) != TYPE_RUNTIMECLASS) continue;
-        if (!get_attrp(type->attrs, ATTR_ACTIVATABLE) && !get_attrp(type->attrs, ATTR_STATIC)) continue;
+        if (!get_attrp(type->attrs, ATTR_ACTIVATABLE) && !get_attrp(type->attrs, ATTR_STATIC) &&
+            !get_attrp(type->attrs, ATTR_COMPOSABLE)) continue;
         put_str( indent, "ForceRemove %s\n", format_namespace( type->namespace, "", ".", type->name, NULL ) );
         put_str( indent++, "{\n" );
         put_str( indent, "val 'DllPath' = s '%%MODULE%%'\n" );
