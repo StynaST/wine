@@ -22,7 +22,17 @@
 #pragma winrt ns_prefix
 
 import "windows.ui.idl";
+import "xaml_abi.idl";
 
 namespace Windows.UI {
     runtimeclass ColorHelper;
+}
+
+namespace Windows.UI.Xaml.Hosting {
+    runtimeclass WindowsXamlManager;
+    runtimeclass DesktopWindowXamlSource;
+}
+
+namespace Windows.UI.Xaml.Markup {
+    runtimeclass XamlReader;
 }

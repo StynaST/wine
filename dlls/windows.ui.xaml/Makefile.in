@@ -1,7 +1,13 @@
 MODULE  = windows.ui.xaml.dll
-IMPORTS = combase
+IMPORTS = combase comctl32 user32 gdi32 advapi32 xmllite shlwapi uuid
 
 SOURCES = \
 	classes.idl \
 	color_helper.c \
-	main.c
+	element.c \
+	hosting.c \
+	main.c \
+	markup.c \
+	reader.c \
+	render.c \
+	xaml_abi.idl

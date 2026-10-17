@@ -1,5 +1,7 @@
-TESTDLL = windows.ui.xaml.dll
-IMPORTS = combase
+TESTDLL   = windows.ui.xaml.dll
+IMPORTS   = combase user32
+PARENTSRC = ..
 
 SOURCES = \
-	xaml.c
+	xaml.c \
+	xaml_abi.idl

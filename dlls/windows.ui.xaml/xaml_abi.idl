@@ -1,0 +1,451 @@
+/*
+ * Windows.UI.Xaml hosting, markup and control ABI subset
+ *
+ * Copyright (C) 2026 FiveM-Linux contributors
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
+#ifdef __WIDL__
+#pragma winrt ns_prefix
+#endif
+
+#pragma makedep header
+
+import "inspectable.idl";
+import "eventtoken.idl";
+import "windowscontracts.idl";
+import "windows.foundation.idl";
+import "windows.ui.idl";
+import "windows.ui.xaml.idl";
+import "dxgi.idl";
+
+/* Interface types this module does not implement are lowered to IInspectable *;
+ * struct and enum parameters keep their ABI size. */
+
+
+namespace Windows.UI.Xaml {
+    typedef struct Thickness Thickness;
+
+    struct Thickness
+    {
+        DOUBLE Left;
+        DOUBLE Top;
+        DOUBLE Right;
+        DOUBLE Bottom;
+    };
+}
+
+namespace Windows.UI.Text {
+    typedef struct FontWeight FontWeight;
+
+    struct FontWeight
+    {
+        UINT16 Weight;
+    };
+}
+
+namespace Windows.UI.Xaml.Hosting {
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        uuid(28258a12-7d82-505b-b210-712b04a58882)
+    ]
+    interface IWindowsXamlManagerStatics : IInspectable
+    {
+        HRESULT InitializeForCurrentThread([out, retval] IInspectable * *result);
+    }
+}
+
+namespace Windows.UI.Xaml.Hosting {
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        uuid(56096c31-1aa0-5288-8818-6e74a2dcaff5)
+    ]
+    interface IWindowsXamlManager : IInspectable
+    {
+    }
+}
+
+namespace Windows.UI.Xaml.Hosting {
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        uuid(5cd61dc0-2561-56e1-8e75-6e44173805e3)
+    ]
+    interface IDesktopWindowXamlSourceFactory : IInspectable
+    {
+        HRESULT CreateInstance([in] IInspectable * baseInterface, [out] IInspectable * *innerInterface, [out, retval] IInspectable * *value);
+    }
+}
+
+namespace Windows.UI.Xaml.Hosting {
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        uuid(d585bfe1-00ff-51be-ba1d-a1329956ea0a)
+    ]
+    interface IDesktopWindowXamlSource : IInspectable
+    {
+        HRESULT get_Content([out, retval] IInspectable * *value);
+        HRESULT put_Content([in] IInspectable * value);
+        HRESULT get_HasFocus([out, retval] boolean *value);
+        HRESULT add_TakeFocusRequested([in] IInspectable * handler, [out, retval] EventRegistrationToken *token);
+        HRESULT remove_TakeFocusRequested([in] EventRegistrationToken token);
+        HRESULT add_GotFocus([in] IInspectable * handler, [out, retval] EventRegistrationToken *token);
+        HRESULT remove_GotFocus([in] EventRegistrationToken token);
+        HRESULT NavigateFocus([in] IInspectable * request, [out, retval] IInspectable * *result);
+    }
+}
+
+namespace Windows.UI.Xaml.Markup {
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        uuid(24374cf1-cceb-48bf-a514-41b0186f84c2)
+    ]
+    interface IXamlReader : IInspectable
+    {
+    }
+}
+
+namespace Windows.UI.Xaml.Markup {
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        uuid(9891c6bd-534f-4955-b85a-8a8dc0dca602)
+    ]
+    interface IXamlReaderStatics : IInspectable
+    {
+        HRESULT Load([in] HSTRING xaml, [out, retval] IInspectable * *result);
+        HRESULT LoadWithInitialTemplateValidation([in] HSTRING xaml, [out, retval] IInspectable * *result);
+    }
+}
+
+namespace Windows.UI.Xaml {
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        uuid(676d0be9-b65c-41c6-ba40-58cf87f201c1)
+    ]
+    interface IUIElement : IInspectable
+    {
+        HRESULT get_DesiredSize([out, retval] Windows.Foundation.Size *value);
+        HRESULT get_AllowDrop([out, retval] boolean *value);
+        HRESULT put_AllowDrop([in] boolean value);
+        HRESULT get_Opacity([out, retval] DOUBLE *value);
+        HRESULT put_Opacity([in] DOUBLE value);
+        HRESULT get_Clip([out, retval] IInspectable * *value);
+        HRESULT put_Clip([in] IInspectable * value);
+        HRESULT get_RenderTransform([out, retval] IInspectable * *value);
+        HRESULT put_RenderTransform([in] IInspectable * value);
+        HRESULT get_Projection([out, retval] IInspectable * *value);
+        HRESULT put_Projection([in] IInspectable * value);
+        HRESULT get_RenderTransformOrigin([out, retval] Windows.Foundation.Point *value);
+        HRESULT put_RenderTransformOrigin([in] Windows.Foundation.Point value);
+        HRESULT get_IsHitTestVisible([out, retval] boolean *value);
+        HRESULT put_IsHitTestVisible([in] boolean value);
+        HRESULT get_Visibility([out, retval] INT32 *value);
+        HRESULT put_Visibility([in] INT32 value);
+        HRESULT get_RenderSize([out, retval] Windows.Foundation.Size *value);
+        HRESULT get_UseLayoutRounding([out, retval] boolean *value);
+        HRESULT put_UseLayoutRounding([in] boolean value);
+        HRESULT get_Transitions([out, retval] IInspectable * *value);
+        HRESULT put_Transitions([in] IInspectable * value);
+        HRESULT get_CacheMode([out, retval] IInspectable * *value);
+        HRESULT put_CacheMode([in] IInspectable * value);
+        HRESULT get_IsTapEnabled([out, retval] boolean *value);
+        HRESULT put_IsTapEnabled([in] boolean value);
+        HRESULT get_IsDoubleTapEnabled([out, retval] boolean *value);
+        HRESULT put_IsDoubleTapEnabled([in] boolean value);
+        HRESULT get_IsRightTapEnabled([out, retval] boolean *value);
+        HRESULT put_IsRightTapEnabled([in] boolean value);
+        HRESULT get_IsHoldingEnabled([out, retval] boolean *value);
+        HRESULT put_IsHoldingEnabled([in] boolean value);
+        HRESULT get_ManipulationMode([out, retval] UINT32 *value);
+        HRESULT put_ManipulationMode([in] UINT32 value);
+        HRESULT get_PointerCaptures([out, retval] IInspectable * *value);
+        HRESULT add_KeyUp([in] IInspectable * handler, [out, retval] EventRegistrationToken *token);
+        HRESULT remove_KeyUp([in] EventRegistrationToken token);
+        HRESULT add_KeyDown([in] IInspectable * handler, [out, retval] EventRegistrationToken *token);
+        HRESULT remove_KeyDown([in] EventRegistrationToken token);
+        HRESULT add_GotFocus([in] IInspectable * handler, [out, retval] EventRegistrationToken *token);
+        HRESULT remove_GotFocus([in] EventRegistrationToken token);
+        HRESULT add_LostFocus([in] IInspectable * handler, [out, retval] EventRegistrationToken *token);
+        HRESULT remove_LostFocus([in] EventRegistrationToken token);
+        HRESULT add_DragEnter([in] IInspectable * handler, [out, retval] EventRegistrationToken *token);
+        HRESULT remove_DragEnter([in] EventRegistrationToken token);
+        HRESULT add_DragLeave([in] IInspectable * handler, [out, retval] EventRegistrationToken *token);
+        HRESULT remove_DragLeave([in] EventRegistrationToken token);
+        HRESULT add_DragOver([in] IInspectable * handler, [out, retval] EventRegistrationToken *token);
+        HRESULT remove_DragOver([in] EventRegistrationToken token);
+        HRESULT add_Drop([in] IInspectable * handler, [out, retval] EventRegistrationToken *token);
+        HRESULT remove_Drop([in] EventRegistrationToken token);
+        HRESULT add_PointerPressed([in] IInspectable * handler, [out, retval] EventRegistrationToken *token);
+        HRESULT remove_PointerPressed([in] EventRegistrationToken token);
+        HRESULT add_PointerMoved([in] IInspectable * handler, [out, retval] EventRegistrationToken *token);
+        HRESULT remove_PointerMoved([in] EventRegistrationToken token);
+        HRESULT add_PointerReleased([in] IInspectable * handler, [out, retval] EventRegistrationToken *token);
+        HRESULT remove_PointerReleased([in] EventRegistrationToken token);
+        HRESULT add_PointerEntered([in] IInspectable * handler, [out, retval] EventRegistrationToken *token);
+        HRESULT remove_PointerEntered([in] EventRegistrationToken token);
+        HRESULT add_PointerExited([in] IInspectable * handler, [out, retval] EventRegistrationToken *token);
+        HRESULT remove_PointerExited([in] EventRegistrationToken token);
+        HRESULT add_PointerCaptureLost([in] IInspectable * handler, [out, retval] EventRegistrationToken *token);
+        HRESULT remove_PointerCaptureLost([in] EventRegistrationToken token);
+        HRESULT add_PointerCanceled([in] IInspectable * handler, [out, retval] EventRegistrationToken *token);
+        HRESULT remove_PointerCanceled([in] EventRegistrationToken token);
+        HRESULT add_PointerWheelChanged([in] IInspectable * handler, [out, retval] EventRegistrationToken *token);
+        HRESULT remove_PointerWheelChanged([in] EventRegistrationToken token);
+        HRESULT add_Tapped([in] IInspectable * handler, [out, retval] EventRegistrationToken *token);
+        HRESULT remove_Tapped([in] EventRegistrationToken token);
+        HRESULT add_DoubleTapped([in] IInspectable * handler, [out, retval] EventRegistrationToken *token);
+        HRESULT remove_DoubleTapped([in] EventRegistrationToken token);
+        HRESULT add_Holding([in] IInspectable * handler, [out, retval] EventRegistrationToken *token);
+        HRESULT remove_Holding([in] EventRegistrationToken token);
+        HRESULT add_RightTapped([in] IInspectable * handler, [out, retval] EventRegistrationToken *token);
+        HRESULT remove_RightTapped([in] EventRegistrationToken token);
+        HRESULT add_ManipulationStarting([in] IInspectable * handler, [out, retval] EventRegistrationToken *token);
+        HRESULT remove_ManipulationStarting([in] EventRegistrationToken token);
+        HRESULT add_ManipulationInertiaStarting([in] IInspectable * handler, [out, retval] EventRegistrationToken *token);
+        HRESULT remove_ManipulationInertiaStarting([in] EventRegistrationToken token);
+        HRESULT add_ManipulationStarted([in] IInspectable * handler, [out, retval] EventRegistrationToken *token);
+        HRESULT remove_ManipulationStarted([in] EventRegistrationToken token);
+        HRESULT add_ManipulationDelta([in] IInspectable * handler, [out, retval] EventRegistrationToken *token);
+        HRESULT remove_ManipulationDelta([in] EventRegistrationToken token);
+        HRESULT add_ManipulationCompleted([in] IInspectable * handler, [out, retval] EventRegistrationToken *token);
+        HRESULT remove_ManipulationCompleted([in] EventRegistrationToken token);
+        HRESULT Measure([in] Windows.Foundation.Size availableSize);
+        HRESULT Arrange([in] Windows.Foundation.Rect finalRect);
+        HRESULT CapturePointer([in] IInspectable * value, [out, retval] boolean *result);
+        HRESULT ReleasePointerCapture([in] IInspectable * value);
+        HRESULT ReleasePointerCaptures();
+        HRESULT AddHandler([in] IInspectable * routedEvent, [in] IInspectable * handler, [in] boolean handledEventsToo);
+        HRESULT RemoveHandler([in] IInspectable * routedEvent, [in] IInspectable * handler);
+        HRESULT TransformToVisual([in] IInspectable * visual, [out, retval] IInspectable * *result);
+        HRESULT InvalidateMeasure();
+        HRESULT InvalidateArrange();
+        HRESULT UpdateLayout();
+    }
+}
+
+namespace Windows.UI.Xaml {
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        uuid(a391d09b-4a99-4b7c-9d8d-6fa5d01f6fbf)
+    ]
+    interface IFrameworkElement : IInspectable
+    {
+        HRESULT get_Triggers([out, retval] IInspectable * *value);
+        HRESULT get_Resources([out, retval] IInspectable * *value);
+        HRESULT put_Resources([in] IInspectable * value);
+        HRESULT get_Tag([out, retval] IInspectable * *value);
+        HRESULT put_Tag([in] IInspectable * value);
+        HRESULT get_Language([out, retval] HSTRING *value);
+        HRESULT put_Language([in] HSTRING value);
+        HRESULT get_ActualWidth([out, retval] DOUBLE *value);
+        HRESULT get_ActualHeight([out, retval] DOUBLE *value);
+        HRESULT get_Width([out, retval] DOUBLE *value);
+        HRESULT put_Width([in] DOUBLE value);
+        HRESULT get_Height([out, retval] DOUBLE *value);
+        HRESULT put_Height([in] DOUBLE value);
+        HRESULT get_MinWidth([out, retval] DOUBLE *value);
+        HRESULT put_MinWidth([in] DOUBLE value);
+        HRESULT get_MaxWidth([out, retval] DOUBLE *value);
+        HRESULT put_MaxWidth([in] DOUBLE value);
+        HRESULT get_MinHeight([out, retval] DOUBLE *value);
+        HRESULT put_MinHeight([in] DOUBLE value);
+        HRESULT get_MaxHeight([out, retval] DOUBLE *value);
+        HRESULT put_MaxHeight([in] DOUBLE value);
+        HRESULT get_HorizontalAlignment([out, retval] INT32 *value);
+        HRESULT put_HorizontalAlignment([in] INT32 value);
+        HRESULT get_VerticalAlignment([out, retval] INT32 *value);
+        HRESULT put_VerticalAlignment([in] INT32 value);
+        HRESULT get_Margin([out, retval] Windows.UI.Xaml.Thickness *value);
+        HRESULT put_Margin([in] Windows.UI.Xaml.Thickness value);
+        HRESULT get_Name([out, retval] HSTRING *value);
+        HRESULT put_Name([in] HSTRING value);
+        HRESULT get_BaseUri([out, retval] IInspectable * *value);
+        HRESULT get_DataContext([out, retval] IInspectable * *value);
+        HRESULT put_DataContext([in] IInspectable * value);
+        HRESULT get_Style([out, retval] IInspectable * *value);
+        HRESULT put_Style([in] IInspectable * value);
+        HRESULT get_Parent([out, retval] IInspectable * *value);
+        HRESULT get_FlowDirection([out, retval] INT32 *value);
+        HRESULT put_FlowDirection([in] INT32 value);
+        HRESULT add_Loaded([in] IInspectable * handler, [out, retval] EventRegistrationToken *token);
+        HRESULT remove_Loaded([in] EventRegistrationToken token);
+        HRESULT add_Unloaded([in] IInspectable * handler, [out, retval] EventRegistrationToken *token);
+        HRESULT remove_Unloaded([in] EventRegistrationToken token);
+        HRESULT add_SizeChanged([in] IInspectable * handler, [out, retval] EventRegistrationToken *token);
+        HRESULT remove_SizeChanged([in] EventRegistrationToken token);
+        HRESULT add_LayoutUpdated([in] IInspectable * handler, [out, retval] EventRegistrationToken *token);
+        HRESULT remove_LayoutUpdated([in] EventRegistrationToken token);
+        HRESULT FindName([in] HSTRING name, [out, retval] IInspectable * *result);
+        HRESULT SetBinding([in] IInspectable * dp, [in] IInspectable * binding);
+    }
+}
+
+namespace Windows.UI.Xaml.Controls {
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        uuid(ae2d9271-3b4a-45fc-8468-f7949548f4d5)
+    ]
+    interface ITextBlock : IInspectable
+    {
+        HRESULT get_FontSize([out, retval] DOUBLE *value);
+        HRESULT put_FontSize([in] DOUBLE value);
+        HRESULT get_FontFamily([out, retval] IInspectable * *value);
+        HRESULT put_FontFamily([in] IInspectable * value);
+        HRESULT get_FontWeight([out, retval] Windows.UI.Text.FontWeight *value);
+        HRESULT put_FontWeight([in] Windows.UI.Text.FontWeight value);
+        HRESULT get_FontStyle([out, retval] INT32 *value);
+        HRESULT put_FontStyle([in] INT32 value);
+        HRESULT get_FontStretch([out, retval] INT32 *value);
+        HRESULT put_FontStretch([in] INT32 value);
+        HRESULT get_CharacterSpacing([out, retval] INT32 *value);
+        HRESULT put_CharacterSpacing([in] INT32 value);
+        HRESULT get_Foreground([out, retval] IInspectable * *value);
+        HRESULT put_Foreground([in] IInspectable * value);
+        HRESULT get_TextWrapping([out, retval] INT32 *value);
+        HRESULT put_TextWrapping([in] INT32 value);
+        HRESULT get_TextTrimming([out, retval] INT32 *value);
+        HRESULT put_TextTrimming([in] INT32 value);
+        HRESULT get_TextAlignment([out, retval] INT32 *value);
+        HRESULT put_TextAlignment([in] INT32 value);
+        HRESULT get_Text([out, retval] HSTRING *value);
+        HRESULT put_Text([in] HSTRING value);
+        HRESULT get_Inlines([out, retval] IInspectable * *value);
+        HRESULT get_Padding([out, retval] Windows.UI.Xaml.Thickness *value);
+        HRESULT put_Padding([in] Windows.UI.Xaml.Thickness value);
+        HRESULT get_LineHeight([out, retval] DOUBLE *value);
+        HRESULT put_LineHeight([in] DOUBLE value);
+        HRESULT get_LineStackingStrategy([out, retval] INT32 *value);
+        HRESULT put_LineStackingStrategy([in] INT32 value);
+        HRESULT get_IsTextSelectionEnabled([out, retval] boolean *value);
+        HRESULT put_IsTextSelectionEnabled([in] boolean value);
+        HRESULT get_SelectedText([out, retval] HSTRING *value);
+        HRESULT get_ContentStart([out, retval] IInspectable * *value);
+        HRESULT get_ContentEnd([out, retval] IInspectable * *value);
+        HRESULT get_SelectionStart([out, retval] IInspectable * *value);
+        HRESULT get_SelectionEnd([out, retval] IInspectable * *value);
+        HRESULT get_BaselineOffset([out, retval] DOUBLE *value);
+        HRESULT add_SelectionChanged([in] IInspectable * handler, [out, retval] EventRegistrationToken *token);
+        HRESULT remove_SelectionChanged([in] EventRegistrationToken token);
+        HRESULT add_ContextMenuOpening([in] IInspectable * handler, [out, retval] EventRegistrationToken *token);
+        HRESULT remove_ContextMenuOpening([in] EventRegistrationToken token);
+        HRESULT SelectAll();
+        HRESULT Select([in] IInspectable * start, [in] IInspectable * end);
+        HRESULT Focus([in] INT32 value, [out, retval] boolean *result);
+    }
+}
+
+namespace Windows.UI.Xaml.Controls.Primitives {
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        uuid(fa002c1a-494e-46cf-91d4-e14a8d798675)
+    ]
+    interface IRangeBase : IInspectable
+    {
+        HRESULT get_Minimum([out, retval] DOUBLE *value);
+        HRESULT put_Minimum([in] DOUBLE value);
+        HRESULT get_Maximum([out, retval] DOUBLE *value);
+        HRESULT put_Maximum([in] DOUBLE value);
+        HRESULT get_SmallChange([out, retval] DOUBLE *value);
+        HRESULT put_SmallChange([in] DOUBLE value);
+        HRESULT get_LargeChange([out, retval] DOUBLE *value);
+        HRESULT put_LargeChange([in] DOUBLE value);
+        HRESULT get_Value([out, retval] DOUBLE *value);
+        HRESULT put_Value([in] DOUBLE value);
+        HRESULT add_ValueChanged([in] IInspectable * handler, [out, retval] EventRegistrationToken *token);
+        HRESULT remove_ValueChanged([in] EventRegistrationToken token);
+    }
+}
+
+namespace Windows.UI.Xaml.Controls {
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        uuid(ae752c89-0067-4963-bf4c-29db0c4a507e)
+    ]
+    interface IProgressBar : IInspectable
+    {
+        HRESULT get_IsIndeterminate([out, retval] boolean *value);
+        HRESULT put_IsIndeterminate([in] boolean value);
+        HRESULT get_ShowError([out, retval] boolean *value);
+        HRESULT put_ShowError([in] boolean value);
+        HRESULT get_ShowPaused([out, retval] boolean *value);
+        HRESULT put_ShowPaused([in] boolean value);
+        HRESULT get_TemplateSettings([out, retval] IInspectable * *value);
+    }
+}
+
+namespace Windows.UI.Xaml.Controls {
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        uuid(c589644f-eba8-427a-b75a-9f1f93a11ae9)
+    ]
+    interface ISwapChainPanel : IInspectable
+    {
+        HRESULT get_CompositionScaleX([out, retval] FLOAT *value);
+        HRESULT get_CompositionScaleY([out, retval] FLOAT *value);
+        HRESULT add_CompositionScaleChanged([in] IInspectable * handler, [out, retval] EventRegistrationToken *token);
+        HRESULT remove_CompositionScaleChanged([in] EventRegistrationToken token);
+        HRESULT CreateCoreIndependentInputSource([in] UINT32 deviceTypes, [out, retval] IInspectable * *result);
+    }
+}
+namespace Windows.UI.Xaml.Hosting {
+    runtimeclass DesktopWindowXamlSource;
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        marshaling_behavior(agile),
+        static(Windows.UI.Xaml.Hosting.IWindowsXamlManagerStatics, Windows.Foundation.UniversalApiContract, 1.0),
+        threading(both)
+    ]
+    runtimeclass WindowsXamlManager
+    {
+        [default] interface Windows.UI.Xaml.Hosting.IWindowsXamlManager;
+        interface Windows.Foundation.IClosable;
+    }
+
+    [
+        composable(Windows.UI.Xaml.Hosting.IDesktopWindowXamlSourceFactory, public, Windows.Foundation.UniversalApiContract, 1.0),
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        marshaling_behavior(agile),
+        threading(both)
+    ]
+    runtimeclass DesktopWindowXamlSource
+    {
+        [default] interface Windows.UI.Xaml.Hosting.IDesktopWindowXamlSource;
+        interface Windows.Foundation.IClosable;
+    }
+}
+
+namespace Windows.UI.Xaml.Markup {
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        marshaling_behavior(agile),
+        static(Windows.UI.Xaml.Markup.IXamlReaderStatics, Windows.Foundation.UniversalApiContract, 1.0),
+        threading(both)
+    ]
+    runtimeclass XamlReader
+    {
+        [default] interface Windows.UI.Xaml.Markup.IXamlReader;
+    }
+}
+
+[
+    object,
+    uuid(f92f19d2-3ade-45a6-a20c-f6f1ea90554b),
+    local
+]
+interface ISwapChainPanelNative : IUnknown
+{
+    HRESULT SetSwapChain([in] IDXGISwapChain *swapchain);
+}
