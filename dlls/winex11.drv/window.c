@@ -49,6 +49,7 @@
 
 #include "x11drv.h"
 #include "wingdi.h"
+#include "ntuser.h"
 #include "winuser.h"
 
 #include "wine/debug.h"
@@ -56,6 +57,14 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(x11drv);
 WINE_DECLARE_DEBUG_CHANNEL(systray);
+
+static void mark_direct_draw_child( HWND hwnd, HWND top )
+{
+    if (!hwnd || hwnd == top) return;
+
+    /* The owner process latches the flag, so repeated posts from foreign drawing processes are harmless. */
+    NtUserPostMessage( hwnd, WM_WINE_SETWINDOWSURFACECLIP, 0, 0 );
+}
 
 #define _NET_WM_MOVERESIZE_SIZE_TOPLEFT      0
 #define _NET_WM_MOVERESIZE_SIZE_TOP          1
@@ -106,6 +115,8 @@ static const WCHAR clip_window_prop[] =
     {'_','_','w','i','n','e','_','x','1','1','_','c','l','i','p','_','w','i','n','d','o','w',0};
 static const WCHAR focus_time_prop[] =
     {'_','_','w','i','n','e','_','x','1','1','_','f','o','c','u','s','_','t','i','m','e',0};
+static const WCHAR frameless_window_prop[] =
+    {'_','_','w','i','n','e','_','w','i','n','3','2','u','_','f','r','a','m','e','l','e','s','s',0};
 
 static const char *debugstr_mwm_hints( const MwmHints *hints )
 {
@@ -537,7 +548,7 @@ static unsigned long get_mwm_decorations_for_style( DWORD style, DWORD ex_style 
     if (X11DRV_HasWindowManager( "Mutter" )) return 0;
 
     if (ex_style & WS_EX_TOOLWINDOW) return 0;
-    if (ex_style & WS_EX_LAYERED) return 0;
+    if ((ex_style & (WS_EX_LAYERED | WS_EX_COMPOSITED)) == WS_EX_LAYERED) return 0;
 
     if ((style & WS_CAPTION) == WS_CAPTION)
     {
@@ -556,6 +567,8 @@ static unsigned long get_mwm_decorations_for_style( DWORD style, DWORD ex_style 
 static unsigned long get_mwm_decorations( struct x11drv_win_data *data, DWORD style, DWORD ex_style )
 {
     if (EqualRect( &data->rects.window, &data->rects.visible )) return 0;
+    /* Frameless windows may still keep non-client borders. */
+    if (NtUserGetProp( data->hwnd, frameless_window_prop )) return 0;
     return get_mwm_decorations_for_style( style, ex_style );
 }
 
@@ -568,6 +581,7 @@ static unsigned long get_mwm_decorations( struct x11drv_win_data *data, DWORD st
 static int get_window_attributes( struct x11drv_win_data *data, XSetWindowAttributes *attr )
 {
     DWORD ex_style = NtUserGetWindowLongW( data->hwnd, GWL_EXSTYLE );
+    BOOL overlay = layered_overlay_shape_enabled() || layered_overlay_alpha_enabled();
 
     attr->colormap          = data->whole_colormap ? data->whole_colormap : default_colormap;
     attr->save_under        = ((NtUserGetClassLongW( data->hwnd, GCL_STYLE ) & CS_SAVEBITS) != 0);
@@ -577,9 +591,10 @@ static int get_window_attributes( struct x11drv_win_data *data, XSetWindowAttrib
     attr->background_pixel  = 0;
     attr->event_mask        = (ExposureMask | KeyPressMask | KeyReleaseMask |
                                FocusChangeMask | KeymapStateMask | StructureNotifyMask | PropertyChangeMask);
-    /* for transparent windows, exclude mouse events to allow mouse pass-through */
-    if (!(ex_style & WS_EX_TRANSPARENT)) attr->event_mask |= (PointerMotionMask | ButtonPressMask |
-                                                              ButtonReleaseMask | EnterWindowMask);
+    /* for transparent windows, exclude mouse events to allow mouse pass-through
+       (overlay-shape mode keeps input so the shaped overlay stays interactive) */
+    if (!(ex_style & WS_EX_TRANSPARENT) || overlay) attr->event_mask |= (PointerMotionMask | ButtonPressMask |
+                                                                       ButtonReleaseMask | EnterWindowMask);
 
     return (CWSaveUnder | CWColormap | CWBorderPixel | CWBackPixel |
             CWEventMask | CWBitGravity | CWBackingStore);
@@ -596,6 +611,9 @@ static void sync_window_input_shape( struct x11drv_win_data *data )
 {
 #ifdef HAVE_LIBXSHAPE
     DWORD ex_style = NtUserGetWindowLongW( data->hwnd, GWL_EXSTYLE );
+    /* ALPHA mode's input shape comes from the readback; with it off keep the stock pass-through */
+    BOOL overlay = layered_overlay_shape_enabled() ||
+                   (layered_overlay_alpha_enabled() && layered_overlay_input_shape_enabled());
     char const *sgi;
 
     if (!data->whole_window) return;
@@ -612,7 +630,7 @@ static void sync_window_input_shape( struct x11drv_win_data *data )
      */
     if ((sgi = getenv( "SteamGameId" )) && !strcmp( sgi, "3678970" )) return;
 
-    if (ex_style & WS_EX_TRANSPARENT)
+    if ((ex_style & WS_EX_TRANSPARENT) && !overlay)
     {
         /* For transparent windows, set an empty input shape to allow mouse pass-through */
         static XRectangle empty_rect;
@@ -1785,10 +1803,40 @@ static int skip_iconify(void)
     return cached;
 }
 
+static BOOL window_minimize_unsupported( struct x11drv_win_data *data )
+{
+    /* Satellite ignores WM_CHANGE_STATE. Do not infer this for other WMs from
+     * missing EWMH hints alone, since legacy ICCCM WMs can still minimize. */
+    return data->managed && !data->embedded && !is_virtual_desktop() &&
+           X11DRV_HasWindowManager( "xwayland-satellite" ) &&
+           !is_net_supported( x11drv_atom(_NET_WM_STATE_HIDDEN) );
+}
+
 static void window_set_wm_state( struct x11drv_win_data *data, UINT new_state, BOOL activate )
 {
     UINT old_state = data->pending_state.wm_state;
     HWND foreground = NtUserGetForegroundWindow();
+
+    /* These compositors may stack Forza's black backing window above the game
+     * despite _NET_WM_STATE_BELOW. Keep it unmapped, including on state replay
+     * and focus changes, without hiding its Win32 window from the game. */
+    if (data->force_below_hack && (X11DRV_HasWindowManager( "steamcompmgr" ) ||
+                                 X11DRV_HasWindowManager( "wlroots wm" )))
+    {
+        new_state = WithdrawnState;
+        activate = FALSE;
+    }
+
+    if (new_state == IconicState && window_minimize_unsupported( data ))
+    {
+        /* Keep the mapped host state instead of waiting for an acknowledgment
+         * that will never arrive. Reconcile Win32 state on the window thread. */
+        TRACE( "window %p/%lx, host minimization unsupported, keeping NormalState\n",
+               data->hwnd, data->whole_window );
+        new_state = NormalState;
+        activate = FALSE;
+        NtUserPostMessage( data->hwnd, WM_WINE_WINDOW_STATE_CHANGED, 0, 0 );
+    }
 
     data->desired_state.wm_state = new_state;
     data->desired_state.activate = activate;
@@ -1955,6 +2003,12 @@ static UINT window_update_client_state( struct x11drv_win_data *data )
     if (data->mwm_hints_serial) return 0; /* another MWM_HINT update is pending, wait for it to complete */
     if (data->configure_serial) return 0; /* another config update is pending, wait for it to complete */
 
+    /* An ignored minimize must not bring a background window back to the
+     * foreground. Satellite sends WM_STATE again when the user focuses it. */
+    if ((old_style & WS_MINIMIZE) && window_minimize_unsupported( data ) &&
+        get_net_active_window( data->display ) != data->whole_window)
+        return 0;
+
     new_style = old_style & ~(WS_VISIBLE | WS_MINIMIZE | WS_MAXIMIZE);
     if (data->current_state.wm_state != WithdrawnState) new_style |= WS_VISIBLE;
     if (data->current_state.wm_state == IconicState) new_style |= WS_MINIMIZE;
@@ -2077,6 +2131,8 @@ BOOL X11DRV_GetWindowStateUpdates( HWND hwnd, UINT *state_cmd, UINT *swp_flags, 
     struct x11drv_thread_data *thread_data = x11drv_thread_data();
     struct x11drv_win_data *data;
     HWND old_foreground;
+    UINT resize_edge = 0;
+    BOOL sizing = FALSE;
 
     if (!state_cmd)
     {
@@ -2116,7 +2172,30 @@ BOOL X11DRV_GetWindowStateUpdates( HWND hwnd, UINT *state_cmd, UINT *swp_flags, 
         *state_cmd = window_update_client_state( data );
         *swp_flags = window_update_client_config( data );
         *rect = window_rect_from_visible( &data->rects, data->current_state.rect );
+        resize_edge = data->resize_edge;
+        sizing = !*state_cmd && *swp_flags && !(*swp_flags & (SWP_NOSIZE | SWP_NOSENDCHANGING)) &&
+                 !data->is_fullscreen && !data->embedded;
         release_win_data( data );
+    }
+
+    if (sizing && !resize_edge)
+    {
+        Window root, child;
+        int root_x, root_y, x, y;
+        unsigned int mask;
+
+        /* Server-side decorations bypass WM_SYSCOMMAND. Only report sizing
+         * for mouse-driven changes, not ordinary window-manager placement. */
+        sizing = (old_foreground == hwnd || *foreground == hwnd) &&
+                 XQueryPointer( thread_data->display, root_window, &root, &child,
+                                &root_x, &root_y, &x, &y, &mask ) && (mask & Button1Mask);
+    }
+    /* Application callbacks must run after releasing the driver window lock. */
+    if (sizing)
+    {
+        RECT proposed = *rect;
+        NtUserSendSizingMessage( hwnd, resize_edge, rect );
+        if (rect->left != proposed.left || rect->top != proposed.top) *swp_flags &= ~SWP_NOMOVE;
     }
 
     if (!*state_cmd && !*swp_flags && !*foreground) return FALSE;
@@ -2248,6 +2327,11 @@ void window_mwm_hints_notify( struct x11drv_win_data *data, unsigned long serial
 
     /* send any pending changes from the desired state */
     window_request_desired_state( data );
+
+    /* The unsupported-minimize restore may have waited for these hints. */
+    if ((NtUserGetWindowLongW( data->hwnd, GWL_STYLE ) & WS_MINIMIZE) &&
+        window_minimize_unsupported( data ))
+        NtUserPostMessage( data->hwnd, WM_WINE_WINDOW_STATE_CHANGED, 0, 0 );
 }
 
 void window_wm_normal_hints_notify( struct x11drv_win_data *data, unsigned long serial, const XSizeHints *value )
@@ -2340,9 +2424,15 @@ static BOOL get_window_net_wm_name( Display *display, Window window, char **name
 
     *name = NULL;
     X11DRV_expect_error( display, host_window_error, NULL );
-    ret = XGetWindowProperty( display, window, x11drv_atom(_NET_WM_NAME), 0, 65536 / sizeof(CARD32), False, x11drv_atom(UTF8_STRING),
+    /* Satellite supplies its ASCII WM name as STRING rather than UTF8_STRING.
+     * A type mismatch otherwise succeeds with an empty buffer from Xlib. */
+    ret = XGetWindowProperty( display, window, x11drv_atom(_NET_WM_NAME), 0, 65536 / sizeof(CARD32), False, AnyPropertyType,
                               &type, &format, &count, &remaining, (unsigned char **)name );
-    return !X11DRV_check_error() && !ret && *name;
+    if (!X11DRV_check_error() && !ret && *name && format == 8 && count &&
+        (type == x11drv_atom(UTF8_STRING) || type == XA_STRING)) return TRUE;
+    XFree( *name );
+    *name = NULL;
+    return FALSE;
 }
 
 static BOOL get_window_wm_name( Display *display, Window window, char **name )
@@ -2808,6 +2898,17 @@ static void create_whole_window( struct x11drv_win_data *data )
     }
     data->shaped = (win_rgn != 0);
 
+    /* Layered overlay (WINE_LAYERED_OVERLAY_ALPHA): give the TOP-LEVEL window a 32-bit
+     * ARGB visual with per-pixel alpha so the compositor blends it (real transparency).
+     * The Vulkan child window being ARGB is not enough — the compositor composites the
+     * top-level, which must itself carry alpha. Env-var scoped to the opted-in game. */
+    if (layered_overlay_alpha_enabled() && argb_visual.visualid &&
+        data->vis.visualid != argb_visual.visualid)
+    {
+        data->vis = argb_visual;
+        data->use_alpha = TRUE;
+    }
+
     if (data->vis.visualid != default_visual.visualid)
         data->whole_colormap = XCreateColormap( data->display, root_window, data->vis.visual, AllocNone );
 
@@ -2991,7 +3092,12 @@ void X11DRV_SetWindowStyle( HWND hwnd, INT offset, STYLESTRUCT *style )
         if (changed & WS_EX_LAYERED) /* changing WS_EX_LAYERED resets attributes */
         {
             data->layered = FALSE;
-            set_window_visual( data, &default_visual, FALSE );
+            /* Layered overlay (WINE_LAYERED_OVERLAY_ALPHA): keep the ARGB visual instead
+             * of resetting to the opaque default, so the compositor keeps blending. */
+            if (layered_overlay_alpha_enabled() && argb_visual.visualid)
+                set_window_visual( data, &argb_visual, TRUE );
+            else
+                set_window_visual( data, &default_visual, FALSE );
             sync_window_opacity( data->display, data->whole_window, 0, 0 );
         }
         if (changed & WS_EX_TRANSPARENT) sync_window_style( data );
@@ -3009,14 +3115,17 @@ done:
  */
 void X11DRV_DestroyWindow( HWND hwnd )
 {
-    struct x11drv_thread_data *thread_data = x11drv_thread_data();
+    struct x11drv_thread_data *thread_data;
     struct x11drv_win_data *data;
 
     if (!(data = get_win_data( hwnd ))) return;
 
     destroy_whole_window( data, FALSE );
-    if (thread_data->last_focus == hwnd) thread_data->last_focus = 0;
-    if (thread_data->last_xic_hwnd == hwnd) thread_data->last_xic_hwnd = 0;
+    if ((thread_data = x11drv_thread_data()))
+    {
+        if (thread_data->last_focus == hwnd) thread_data->last_focus = 0;
+        if (thread_data->last_xic_hwnd == hwnd) thread_data->last_xic_hwnd = 0;
+    }
     if (data->icon_pixmap) XFreePixmap( gdi_display, data->icon_pixmap );
     if (data->icon_mask) XFreePixmap( gdi_display, data->icon_mask );
     if (data->parent) host_window_release( data->parent );
@@ -3371,6 +3480,14 @@ BOOL X11DRV_SystrayDockInsert( HWND hwnd, UINT cx, UINT cy, void *icon )
 
     if (!(data = get_win_data( hwnd ))) return FALSE;
     set_window_visual( data, &visual, TRUE );
+    /* The tray host may have destroyed the embedded X window. An unchanged
+     * visual does not recreate it, but a new dock request needs a valid XID. */
+    if (!data->whole_window) create_whole_window( data );
+    if (!data->whole_window)
+    {
+        release_win_data( data );
+        return FALSE;
+    }
     make_window_embedded( data );
     window = data->whole_window;
     release_win_data( data );
@@ -3455,6 +3572,7 @@ void X11DRV_GetDC( HDC hdc, HWND hwnd, HWND top, const RECT *win_rect,
     {
         escape.drawable = X11DRV_get_whole_window( top );
         escape.visual = default_visual; /* FIXME: use the right visual for other process window */
+        if (escape.drawable) mark_direct_draw_child( hwnd, top );
     }
 
     if (!escape.drawable) return; /* don't create a GC for foreign windows */
@@ -3709,7 +3827,7 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
 
     /* layered windows are mapped only once their attributes are set */
     if (data->pending_state.wm_state == WithdrawnState && (new_style & WS_VISIBLE) &&
-        (ex_style & WS_EX_LAYERED) && !data->layered && !IsRectEmpty( &new_rects->window ))
+        (ex_style & (WS_EX_LAYERED | WS_EX_COMPOSITED)) == WS_EX_LAYERED && !data->layered && !IsRectEmpty( &new_rects->window ))
     {
         WARN( "win %p/%lx is layered, delaying mapping\n", hwnd, data->whole_window );
         new_style &= ~WS_VISIBLE;
@@ -3719,11 +3837,16 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
 
     if (use_force_below_hack())
     {
-        if (insert_after != HWND_BOTTOM && insert_after != HWND_NOTOPMOST && insert_after != HWND_TOP && insert_after != HWND_TOPMOST)
+        /* Login dialogs also use explicit Z order. Only the disabled fullscreen
+         * tool popup is a backing window; retain its flag across focus changes. */
+        if ((new_style & (WS_POPUP | WS_DISABLED | WS_CHILD)) != (WS_POPUP | WS_DISABLED) ||
+            (ex_style & (WS_EX_TOOLWINDOW | WS_EX_APPWINDOW)) != WS_EX_TOOLWINDOW)
+            data->force_below_hack = 0;
+        else if (fullscreen && insert_after != HWND_BOTTOM && insert_after != HWND_NOTOPMOST &&
+                 insert_after != HWND_TOP && insert_after != HWND_TOPMOST)
         {
             WARN( "%p/%#lx setting force_below_hack.\n", hwnd, data->whole_window );
             data->force_below_hack = 1;
-            if (X11DRV_HasWindowManager( "steamcompmgr" )) new_style &= ~WS_VISIBLE;
         }
     }
 
@@ -4011,6 +4134,8 @@ LRESULT X11DRV_WindowMessage( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
     case WM_X11DRV_ADD_TAB:
         taskbar_add_tab( hwnd );
         return 0;
+    case WM_WINE_MAP_NOTIFY_ICON_POINT:
+        return 0;
     default:
         FIXME( "got window msg %x hwnd %p wp %lx lp %lx\n", msg, hwnd, (long)wp, lp );
         return 0;
@@ -4062,6 +4187,7 @@ static LRESULT start_screensaver(void)
 LRESULT X11DRV_SysCommand( HWND hwnd, WPARAM wparam, LPARAM lparam, const POINT *pos )
 {
     WPARAM hittest = wparam & 0x0f;
+    UINT old_resize_edge;
     int dir;
     struct x11drv_win_data *data;
 
@@ -4119,8 +4245,16 @@ LRESULT X11DRV_SysCommand( HWND hwnd, WPARAM wparam, LPARAM lparam, const POINT 
         goto failed;
     }
 
+    old_resize_edge = data->resize_edge;
+    data->resize_edge = (wparam & 0xfff0) == SC_SIZE && hittest >= WMSZ_LEFT && hittest <= WMSZ_BOTTOMRIGHT ?
+                       hittest : 0;
     release_win_data( data );
     move_resize_window( hwnd, dir, *pos );
+    if ((data = get_win_data( hwnd )))
+    {
+        data->resize_edge = old_resize_edge;
+        release_win_data( data );
+    }
     return 0;
 
 failed:
@@ -4209,6 +4343,7 @@ void net_supporting_wm_check_init( struct x11drv_thread_data *data )
         char const *sgi = getenv( "SteamGameId" );
 
         if (!strcmp( data->window_manager, "GNOME Shell" )) strcpy( data->window_manager, "Mutter" );
+        if (!strcmp( data->window_manager, "Mutter (Muffin)" )) strcpy( data->window_manager, "Mutter" );
         TRACE( "Detected window manager: %s\n", debugstr_a(data->window_manager) );
 
         /* Street Fighter V expects a certain sequence of window resizes

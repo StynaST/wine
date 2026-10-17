@@ -5276,15 +5276,65 @@ static void test_window_styles(void)
     }
 }
 
+static HWND root_dialog(HWND hwnd)
+{
+    while ((GetWindowLongA(hwnd, GWL_EXSTYLE) & WS_EX_CONTROLPARENT) &&
+           (GetWindowLongA(hwnd, GWL_STYLE) & (WS_CHILD|WS_POPUP)) == WS_CHILD)
+    {
+        HWND parent = GetParent(hwnd);
+
+        /* simple detector for a window being a dialog */
+        if (!DefDlgProcA(parent, DM_GETDEFID, 0, 0))
+            break;
+
+        hwnd = parent;
+
+        if (!(GetWindowLongA(hwnd, GWL_STYLE) & DS_CONTROL))
+            break;
+    }
+
+    return hwnd;
+}
+
 static INT_PTR WINAPI empty_dlg_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 {
     return 0;
 }
 
+static LRESULT expected_id;
+
 static INT_PTR WINAPI empty_dlg_proc3(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 {
     if (msg == WM_INITDIALOG)
+    {
+        HWND parent = GetParent(hwnd);
+        LRESULT id, ret;
+
+        id = DefDlgProcA(parent, DM_GETDEFID, 0, 0);
+        if (!id || root_dialog(hwnd) == hwnd)
+            parent = 0;
+
+        id = DefDlgProcA(hwnd, DM_GETDEFID, 0, 0);
+        if (!parent)
+            ok(id == MAKELONG(IDOK,DC_HASDEFID), "expected (IDOK,DC_HASDEFID), got %08lx\n", id);
+        else
+            ok(id == expected_id, "expected %08lx, got %08lx\n", expected_id, id);
+
+        ret = DefDlgProcA(hwnd, DM_SETDEFID, 0x3333, 0);
+        ok(ret, "DefDlgProc(DM_SETDEFID) failed\n");
+        id = DefDlgProcA(hwnd, DM_GETDEFID, 0, 0);
+        ok(id == MAKELONG(0x3333,DC_HASDEFID), "expected (0x3333,DC_HASDEFID), got %08lx\n", id);
+
+        if (parent)
+        {
+            id = DefDlgProcA(parent, DM_GETDEFID, 0, 0);
+            ok(id == MAKELONG(0x3333,DC_HASDEFID), "expected (0x3333,DC_HASDEFID), got %08lx\n", id);
+
+            expected_id = MAKELONG(0x3333,DC_HASDEFID);
+        }
+
         EndDialog(hwnd, 0);
+    }
 
     return 0;
 }
@@ -5303,6 +5353,16 @@ static INT_PTR WINAPI empty_dlg_proc2(HWND hwnd, UINT msg, WPARAM wparam, LPARAM
         struct dialog_param *param = (struct dialog_param *)lparam;
         BOOL parent_is_child;
         HWND disabled_hwnd;
+        LRESULT id, ret;
+
+        id = DefDlgProcA(hwnd, DM_GETDEFID, 0, 0);
+        ok(id == MAKELONG(IDOK,DC_HASDEFID), "expected (IDOK,DC_HASDEFID), got %08lx\n", id);
+        ret = DefDlgProcA(hwnd, DM_SETDEFID, 0x2222, 0);
+        ok(ret, "DefDlgProc(DM_SETDEFID) failed\n");
+        id = DefDlgProcA(hwnd, DM_GETDEFID, 0, 0);
+        ok(id == MAKELONG(0x2222,DC_HASDEFID), "expected (0x2222,DC_HASDEFID), got %08lx\n", id);
+
+        expected_id = MAKELONG(0x2222,DC_HASDEFID);
 
         parent_is_child = (GetWindowLongA(param->parent, GWL_STYLE) & (WS_POPUP | WS_CHILD)) == WS_CHILD;
 
@@ -5344,6 +5404,25 @@ static INT_PTR WINAPI empty_dlg_proc2(HWND hwnd, UINT msg, WPARAM wparam, LPARAM
         DialogBoxIndirectParamA(GetModuleHandleA(NULL), param->dlg_data, hwnd, empty_dlg_proc3, 0);
         ok(IsWindowEnabled(hwnd), "wrong state for %p (%08lx)\n", hwnd, style);
 
+        param->dlg_data->style |= DS_CONTROL;
+        DialogBoxIndirectParamA(GetModuleHandleA(NULL), param->dlg_data, hwnd, empty_dlg_proc3, 0);
+        ok(IsWindowEnabled(hwnd), "wrong state for %p (%08x)\n", hwnd, style);
+
+        param->dlg_data->dwExtendedStyle |= WS_EX_CONTROLPARENT;
+        SetWindowLongA(hwnd, GWL_EXSTYLE, GetWindowLongA(hwnd, GWL_EXSTYLE) | WS_EX_CONTROLPARENT);
+        SetWindowLongA(hwnd, GWL_STYLE, style & ~DS_CONTROL);
+        param->dlg_data->style &= ~DS_CONTROL;
+        DialogBoxIndirectParamA(GetModuleHandleA(NULL), param->dlg_data, hwnd, empty_dlg_proc3, 0);
+        ok(IsWindowEnabled(hwnd), "wrong state for %p (%08x)\n", hwnd, style);
+
+        SetWindowLongA(hwnd, GWL_STYLE, style | DS_CONTROL);
+        DialogBoxIndirectParamA(GetModuleHandleA(NULL), param->dlg_data, hwnd, empty_dlg_proc3, 0);
+        ok(IsWindowEnabled(hwnd), "wrong state for %p (%08x)\n", hwnd, style);
+
+        param->dlg_data->style |= DS_CONTROL;
+        DialogBoxIndirectParamA(GetModuleHandleA(NULL), param->dlg_data, hwnd, empty_dlg_proc3, 0);
+        ok(IsWindowEnabled(hwnd), "wrong state for %p (%08x)\n", hwnd, style);
+
         EndDialog(hwnd, 0);
     }
     return 0;
@@ -5362,6 +5441,7 @@ static void check_dialog_style(DWORD style_in, DWORD ex_style_in, DWORD style_ou
     DWORD style, ex_style;
     HWND hwnd, grand_parent = 0, parent = 0;
     struct dialog_param param;
+    LRESULT id, ret;
 
     if (style_in & WS_CHILD)
     {
@@ -5388,6 +5468,13 @@ static void check_dialog_style(DWORD style_in, DWORD ex_style_in, DWORD style_ou
 
     hwnd = CreateDialogIndirectParamA(GetModuleHandleA(NULL), &dlg_data.dt, parent, empty_dlg_proc, 0);
     ok(hwnd != 0, "dialog creation failed, style %#lx, exstyle %#lx\n", style_in, ex_style_in);
+
+    id = DefDlgProcA(hwnd, DM_GETDEFID, 0, 0);
+    ok(id == MAKELONG(IDOK,DC_HASDEFID), "expected (IDOK,DC_HASDEFID), got %08lx\n", id);
+    ret = DefDlgProcA(hwnd, DM_SETDEFID, 0x1111, 0);
+    ok(ret, "DefDlgProc(DM_SETDEFID) failed\n");
+    id = DefDlgProcA(hwnd, DM_GETDEFID, 0, 0);
+    ok(id == MAKELONG(0x1111,DC_HASDEFID), "expected (0x1111,DC_HASDEFID), got %08lx\n", id);
 
     flush_events( TRUE );
 
@@ -12735,6 +12822,87 @@ static void test_destroy_quit(void)
     CloseHandle( thread1 );
 }
 
+static struct
+{
+    HANDLE ready, stop;
+    HWND window;
+    HMENU menu;
+    LONG destroyed;
+} terminated_window;
+
+static LRESULT WINAPI terminated_window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
+{
+    if (msg == WM_DESTROY || msg == WM_NCDESTROY)
+        InterlockedIncrement( &terminated_window.destroyed );
+    return DefWindowProcW( hwnd, msg, wparam, lparam );
+}
+
+static DWORD WINAPI terminated_window_thread( void *arg )
+{
+    terminated_window.menu = CreateMenu();
+    terminated_window.window = CreateWindowW( L"terminated_window", L"terminated window",
+                                              WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                                              100, 100, 200, 100, NULL,
+                                              terminated_window.menu, NULL, NULL );
+    SetEvent( terminated_window.ready );
+    WaitForSingleObject( terminated_window.stop, INFINITE );
+    return 0;
+}
+
+static void test_terminated_thread_window(void)
+{
+    WNDCLASSW cls = {0};
+    HANDLE thread;
+    HWND survivor;
+    DWORD ret;
+    BOOL result;
+
+    cls.lpfnWndProc = terminated_window_proc;
+    cls.lpszClassName = L"terminated_window";
+    cls.hInstance = GetModuleHandleW( NULL );
+    ok( RegisterClassW( &cls ), "RegisterClass failed: %lu\n", GetLastError() );
+    terminated_window.ready = CreateEventW( NULL, FALSE, FALSE, NULL );
+    terminated_window.stop = CreateEventW( NULL, FALSE, FALSE, NULL );
+    terminated_window.destroyed = 0;
+    survivor = CreateWindowW( L"static", L"survivor", WS_OVERLAPPEDWINDOW,
+                              400, 100, 200, 100, NULL, NULL, NULL, NULL );
+    ok( !!survivor, "CreateWindow failed: %lu\n", GetLastError() );
+
+    thread = CreateThread( NULL, 0, terminated_window_thread, NULL, 0, NULL );
+    ok( !!thread, "CreateThread failed: %lu\n", GetLastError() );
+    if (!thread) goto cleanup;
+    ret = WaitForSingleObject( terminated_window.ready, 10000 );
+    ok( ret == WAIT_OBJECT_0, "Window creation wait returned %#lx\n", ret );
+    if (ret != WAIT_OBJECT_0)
+    {
+        SetEvent( terminated_window.stop );
+        WaitForSingleObject( thread, 10000 );
+        CloseHandle( thread );
+        goto cleanup;
+    }
+    ok( IsWindow( terminated_window.window ), "Thread window was not created\n" );
+    ok( IsMenu( terminated_window.menu ), "Thread menu was not created\n" );
+    result = TerminateThread( thread, 12 );
+    ok( result, "TerminateThread failed: %lu\n", GetLastError() );
+    if (!result) SetEvent( terminated_window.stop );
+    ret = WaitForSingleObject( thread, 10000 );
+    ok( ret == WAIT_OBJECT_0, "Thread termination wait returned %#lx\n", ret );
+    CloseHandle( thread );
+    flush_events( TRUE );
+
+    ok( !IsWindow( terminated_window.window ), "Terminated thread window remains valid\n" );
+    ok( !IsMenu( terminated_window.menu ), "Terminated thread window menu remains valid\n" );
+    ok( !terminated_window.destroyed, "Window procedure received destruction messages: %ld\n",
+        terminated_window.destroyed );
+    ok( IsWindow( survivor ), "Surviving thread window was destroyed\n" );
+
+cleanup:
+    DestroyWindow( survivor );
+    CloseHandle( terminated_window.ready );
+    CloseHandle( terminated_window.stop );
+    UnregisterClassW( cls.lpszClassName, cls.hInstance );
+}
+
 static void test_IsWindowEnabled(void)
 {
     BOOL ret;
@@ -14815,6 +14983,7 @@ START_TEST(win)
     test_hide_window();
     test_minimize_window(hwndMain);
     test_destroy_quit();
+    test_terminated_thread_window();
     test_IsWindowEnabled();
     test_window_placement();
     test_arrange_iconic_windows();

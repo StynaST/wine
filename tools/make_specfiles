@@ -134,6 +134,7 @@ my @dll_groups =
  [
   "ntoskrnl.exe",
   "hal",
+  "win32k.sys",
  ],
  [
   "mscoree",
@@ -146,6 +147,11 @@ my @dll_groups =
  [
   "shell32",
   "windows.storage",
+ ],
+ [
+  "icu",
+  "icuin",
+  "icuuc",
  ],
 );
 

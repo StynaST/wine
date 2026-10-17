@@ -237,6 +237,7 @@ static const struct wined3d_extension_map gl_extension_map[] =
     {"GL_NV_vertex_program2_option",        NV_VERTEX_PROGRAM2_OPTION     },
     {"GL_NV_vertex_program3",               NV_VERTEX_PROGRAM3            },
     {"GL_NV_texture_barrier",               NV_TEXTURE_BARRIER            },
+    {"GL_NVX_gpu_memory_info",              NVX_GPU_MEMORY_INFO           },
 };
 
 static const struct wined3d_extension_map wgl_extension_map[] =
@@ -990,7 +991,7 @@ static void quirk_no_independent_bit_depths(struct wined3d_gl_info *gl_info)
 }
 
 static const struct wined3d_gpu_description *query_gpu_description(const struct wined3d_gl_info *gl_info,
-        UINT64 *vram_bytes)
+        struct wined3d_gpu_description *runtime_description, const char *gl_renderer, UINT64 *vram_bytes)
 {
     const struct wined3d_gpu_description *gpu_description = NULL, *gpu_description_override;
     enum wined3d_pci_vendor vendor = PCI_VENDOR_NONE;
@@ -1011,9 +1012,34 @@ static const struct wined3d_gpu_description *query_gpu_description(const struct 
 
         gpu_description = wined3d_get_gpu_description(vendor, device);
     }
+    else if (gl_info->supported[NVX_GPU_MEMORY_INFO])
+    {
+        GLint vram_kb;
+        gl_info->gl_ops.gl.p_glGetIntegerv(GL_GPU_MEMORY_INFO_DEDICATED_VIDMEM_NVX, &vram_kb);
+
+        *vram_bytes = (UINT64)vram_kb * 1024;
+        TRACE("Got 0x%s as video memory from NVX_GPU_MEMORY_INFO extension.\n",
+                wine_dbgstr_longlong(*vram_bytes));
+
+        gpu_description = wined3d_get_gpu_description(vendor, device);
+    }
 
     if ((gpu_description_override = wined3d_get_user_override_gpu_description(vendor, device)))
         gpu_description = gpu_description_override;
+
+    if (!gpu_description && vendor != PCI_VENDOR_NONE && device != PCI_DEVICE_NONE)
+    {
+        FIXME("Failed to retrieve GPU description for device %s %04x:%04x.\n",
+                debugstr_a(gl_renderer), vendor, device);
+
+        runtime_description->vendor = vendor;
+        runtime_description->device = device;
+        runtime_description->description = gl_renderer;
+        runtime_description->driver = wined3d_guess_display_driver(vendor);
+        runtime_description->vidmem = min(*vram_bytes / (1024 * 1024), (UINT64)UINT_MAX);
+
+        gpu_description = runtime_description;
+    }
 
     return gpu_description;
 }
@@ -1174,6 +1200,7 @@ static enum wined3d_gl_vendor wined3d_guess_gl_vendor(const struct wined3d_gl_in
         return GL_VENDOR_FGLRX;
 
     if (strstr(gl_vendor_string, "Mesa")
+            || strstr(gl_vendor_string, "Brian Paul")
             || strstr(gl_vendor_string, "X.Org")
             || strstr(gl_vendor_string, "Advanced Micro Devices, Inc.")
             || strstr(gl_vendor_string, "DRI R300 Project")
@@ -3787,7 +3814,8 @@ static BOOL wined3d_adapter_init_gl_caps(struct wined3d_adapter_gl *adapter_gl,
     gl_vendor = wined3d_guess_gl_vendor(gl_info, gl_vendor_str, gl_renderer_str, gl_version_str);
     TRACE("Guessed GL vendor %#x.\n", gl_vendor);
 
-    if (!(caps_gl_ctx->gpu_description = query_gpu_description(gl_info, &caps_gl_ctx->vram_bytes)))
+    if (!(caps_gl_ctx->gpu_description = query_gpu_description(gl_info,
+            &caps_gl_ctx->runtime_gpu_description, gl_renderer_str, &caps_gl_ctx->vram_bytes)))
     {
         enum wined3d_feature_level feature_level;
         struct fragment_caps fragment_caps;
@@ -4135,6 +4163,7 @@ static void adapter_gl_get_wined3d_caps(const struct wined3d_adapter *adapter, s
     const struct wined3d_d3d_info *d3d_info = &adapter->d3d_info;
 
     caps->ddraw_caps.dds_caps |= WINEDDSCAPS_BACKBUFFER
+            | WINEDDSCAPS_FLIP
             | WINEDDSCAPS_COMPLEX
             | WINEDDSCAPS_FRONTBUFFER
             | WINEDDSCAPS_3DDEVICE
@@ -5057,6 +5086,19 @@ static BOOL wined3d_adapter_gl_init(struct wined3d_adapter_gl *adapter_gl,
 #undef USE_GL_FUNC
         gl_info->gl_ops.wgl.p_wglSwapBuffers = (void *)GetProcAddress(mod_gl, "wglSwapBuffers");
         gl_info->gl_ops.wgl.p_wglGetPixelFormat = (void *)GetProcAddress(mod_gl, "wglGetPixelFormat");
+        gl_info->p_wglWineCloseDmaBufWINE = (void *)GetProcAddress(mod_gl, "wglWineCloseDmaBufWINE");
+        gl_info->p_wglWineDmaBufExportSupportedWINE = (void *)GetProcAddress(mod_gl, "wglWineDmaBufExportSupportedWINE");
+        gl_info->p_wglWineExportDmaBufWINE = (void *)GetProcAddress(mod_gl, "wglWineExportDmaBufWINE");
+        gl_info->p_wglWineHwndDmaBufOpenProducerWINE =
+                (void *)GetProcAddress(mod_gl, "wglWineHwndDmaBufOpenProducerWINE");
+        gl_info->p_wglWineHwndDmaBufGetCapsWINE =
+                (void *)GetProcAddress(mod_gl, "wglWineHwndDmaBufGetCapsWINE");
+        gl_info->p_wglWineHwndDmaBufCloseProducerWINE =
+                (void *)GetProcAddress(mod_gl, "wglWineHwndDmaBufCloseProducerWINE");
+        gl_info->p_wglWineHwndDmaBufPublishWINE =
+                (void *)GetProcAddress(mod_gl, "wglWineHwndDmaBufPublishWINE");
+        gl_info->p_wglWineHwndDmaBufDrainReleaseWINE =
+                (void *)GetProcAddress(mod_gl, "wglWineHwndDmaBufDrainReleaseWINE");
     }
 
     gl_info->p_glEnableWINE = gl_info->gl_ops.gl.p_glEnable;

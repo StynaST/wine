@@ -139,7 +139,7 @@ struct context_data
         struct { unsigned __int64 rax, rbx, rcx, rdx, rbp, rsi, rdi,
                                   r8, r9, r10, r11, r12, r13, r14, r15; } x86_64_regs;
         struct { unsigned int r[13]; } arm_regs;
-        struct { unsigned __int64 x[31]; } arm64_regs;
+        struct { unsigned __int64 x0[18], x19[12]; } arm64_regs;
     } integer;
     union
     {
@@ -173,16 +173,21 @@ struct context_data
     {
         struct { struct { unsigned __int64 low, high; } ymm_high[16]; } regs;
     } ymm;
+    union
+    {
+        unsigned __int64 arm64_x18;
+    } tls;
 };
 
-#define SERVER_CTX_CONTROL            0x01
-#define SERVER_CTX_INTEGER            0x02
-#define SERVER_CTX_SEGMENTS           0x04
-#define SERVER_CTX_FLOATING_POINT     0x08
-#define SERVER_CTX_DEBUG_REGISTERS    0x10
-#define SERVER_CTX_EXTENDED_REGISTERS 0x20
-#define SERVER_CTX_YMM_REGISTERS      0x40
-#define SERVER_CTX_EXEC_SPACE         0x80
+#define SERVER_CTX_CONTROL            0x0001
+#define SERVER_CTX_INTEGER            0x0002
+#define SERVER_CTX_SEGMENTS           0x0004
+#define SERVER_CTX_FLOATING_POINT     0x0008
+#define SERVER_CTX_DEBUG_REGISTERS    0x0010
+#define SERVER_CTX_EXTENDED_REGISTERS 0x0020
+#define SERVER_CTX_YMM_REGISTERS      0x0040
+#define SERVER_CTX_EXEC_SPACE         0x0080
+#define SERVER_CTX_TLS                0x0100
 
 
 struct send_fd
@@ -259,6 +264,98 @@ struct rectangle
     int  right;
     int  bottom;
 };
+
+#define HWND_DMABUF_DESC_VERSION_V1       1
+#define HWND_DMABUF_MAX_DIRTY_RECTS       7
+#define HWND_DMABUF_MAX_PLANES            4
+
+enum hwnd_dmabuf_status
+{
+    HWND_DMABUF_OK = 0,
+    HWND_DMABUF_INVALID_ARGS = 1,
+    HWND_DMABUF_NOT_FOUND = 2,
+    HWND_DMABUF_NO_FRAME = 3,
+    HWND_DMABUF_BUSY = 4
+};
+
+#define HWND_DMABUF_RELEASE_PRESENTED     0x00000001
+#define HWND_DMABUF_RELEASE_FAILED        0x00000002
+#define HWND_DMABUF_RELEASE_DROPPED       0x00000004
+#define HWND_DMABUF_RELEASE_ORPHANED      0x00000008
+#define HWND_DMABUF_RELEASE_CACHED        0x00000010
+
+#define HWND_DMABUF_RELEASE_CONSUMER_ACTIVE    0x00000020
+#define HWND_DMABUF_RELEASE_CONSUMER_SUSPENDED 0x00000040
+
+
+/* image_id names a dmabuf slot whose backing store stays valid until its release
+ * token returns. The consumer may cache and reuse the wl_buffer for that slot.
+ * Producers that export a fresh dmabuf for every frame must not set this flag. */
+#define HWND_DMABUF_FLAG_STABLE_SLOT      0x00000001
+
+#define HWND_DMABUF_FLAG_SHM              0x00000002
+
+#define HWND_DMABUF_FLAG_GDI_OVERLAY      0x00000004
+
+#define HWND_DMABUF_FRAME_OPENED          0x00000001
+#define HWND_DMABUF_FRAME_GDI_OVERLAY     0x00000002
+
+#define HWND_DMABUF_CHANNEL_GDI_OVERLAY   0x00000001
+
+typedef struct
+{
+    unsigned short RedPrimary[2];
+    unsigned short GreenPrimary[2];
+    unsigned short BluePrimary[2];
+    unsigned short WhitePoint[2];
+    unsigned int   MaxMasteringLuminance;
+    unsigned int   MinMasteringLuminance;
+    unsigned short MaxContentLightLevel;
+    unsigned short MaxFrameAverageLightLevel;
+} hwnd_dmabuf_hdr_metadata_hdr10_t;
+
+typedef struct
+{
+    unsigned int     version;
+    unsigned int     flags;
+    unsigned int     width;
+    unsigned int     height;
+    unsigned int     fourcc;
+    unsigned int     stride;
+    unsigned int     offset;
+    unsigned int     frame_seq;
+    unsigned int     ring_generation;
+    unsigned int     image_id;
+    unsigned int     sync_fd_kind;
+    unsigned int     dirty_count;
+    unsigned short   dirty_rects[HWND_DMABUF_MAX_DIRTY_RECTS][4];
+    unsigned __int64 modifier;
+    unsigned __int64 producer_unique_id;
+    unsigned __int64 sync_timeline_point;
+    unsigned __int64 release_token;
+    unsigned int     dxgi_format;
+    unsigned int     alpha_mode;
+    unsigned int     color_space;
+    unsigned int     hdr_metadata_type;
+    hwnd_dmabuf_hdr_metadata_hdr10_t hdr_metadata;
+
+    unsigned int     plane_count;
+    unsigned int     plane_offsets[HWND_DMABUF_MAX_PLANES];
+    unsigned int     plane_strides[HWND_DMABUF_MAX_PLANES];
+} hwnd_dmabuf_frame_desc_t;
+
+typedef struct
+{
+    user_handle_t hwnd;
+    user_handle_t host_hwnd;
+    struct rectangle window;
+    struct rectangle client;
+    unsigned int style;
+    unsigned int ex_style;
+    unsigned int dpi;
+    unsigned int frame_seq;
+    unsigned int opened;
+} hwnd_dmabuf_frame_info_t;
 
 
 struct async_data
@@ -977,6 +1074,12 @@ struct obj_locator
 #define WH_WINEVENT      (WH_MAXHOOK + 1)
 #define NB_HOOKS         (WH_WINEVENT - WH_MINHOOK + 1)
 
+struct directory_file_entry
+{
+    data_size_t name_len;
+
+};
+
 struct shared_cursor
 {
     int                  x;
@@ -1120,8 +1223,8 @@ struct new_thread_request
     unsigned int access;
     unsigned int flags;
     int          request_fd;
+    int          is_system;
     /* VARARG(objattr,object_attributes); */
-    char __pad_28[4];
 };
 struct new_thread_reply
 {
@@ -1148,6 +1251,13 @@ struct get_startup_info_reply
 };
 
 
+struct cpu_topology_override
+{
+    unsigned int cpu_count;
+    unsigned char host_cpu_id[64];
+};
+
+
 
 struct init_process_done_request
 {
@@ -1155,6 +1265,7 @@ struct init_process_done_request
     char __pad_12[4];
     client_ptr_t teb;
     client_ptr_t peb;
+    client_ptr_t ldt_copy;
 };
 struct init_process_done_reply
 {
@@ -1173,6 +1284,7 @@ struct init_first_thread_request
     int          debug_level;
     int          reply_fd;
     int          wait_fd;
+    /* VARARG(cpu_override,cpu_topology_override); */
 };
 struct init_first_thread_reply
 {
@@ -1391,25 +1503,27 @@ struct set_thread_info_request
     int          priority;
     int          base_priority;
     affinity_t   affinity;
+    affinity_t   system_affinity;
     client_ptr_t entry_point;
     obj_handle_t token;
     int          disable_boost;
     unsigned int mask;
     /* VARARG(desc,unicode_str); */
-    char __pad_52[4];
+    char __pad_60[4];
 };
 struct set_thread_info_reply
 {
     struct reply_header __header;
 };
-#define SET_THREAD_INFO_PRIORITY        0x01
-#define SET_THREAD_INFO_BASE_PRIORITY   0x02
-#define SET_THREAD_INFO_AFFINITY        0x04
-#define SET_THREAD_INFO_TOKEN           0x08
-#define SET_THREAD_INFO_ENTRYPOINT      0x10
-#define SET_THREAD_INFO_DESCRIPTION     0x20
-#define SET_THREAD_INFO_DBG_HIDDEN      0x40
-#define SET_THREAD_INFO_DISABLE_BOOST   0x80
+#define SET_THREAD_INFO_PRIORITY        0x001
+#define SET_THREAD_INFO_BASE_PRIORITY   0x002
+#define SET_THREAD_INFO_AFFINITY        0x004
+#define SET_THREAD_INFO_GROUP_AFFINITY  0x008
+#define SET_THREAD_INFO_TOKEN           0x010
+#define SET_THREAD_INFO_ENTRYPOINT      0x020
+#define SET_THREAD_INFO_DESCRIPTION     0x040
+#define SET_THREAD_INFO_DBG_HIDDEN      0x080
+#define SET_THREAD_INFO_DISABLE_BOOST   0x100
 
 
 
@@ -1417,12 +1531,14 @@ struct suspend_thread_request
 {
     struct request_header __header;
     obj_handle_t handle;
+    obj_handle_t waited_handle;
+    char __pad_20[4];
 };
 struct suspend_thread_reply
 {
     struct reply_header __header;
     int          count;
-    char __pad_12[4];
+    obj_handle_t wait_handle;
 };
 
 
@@ -2212,10 +2328,13 @@ struct get_mapping_info_reply
     unsigned int flags;
     obj_handle_t shared_file;
     data_size_t  name_len;
+    data_size_t  ver_len;
     data_size_t  total;
     /* VARARG(image,pe_image_info); */
+    /* VARARG(version,version_res,ver_len); */
     /* VARARG(name,unicode_str,name_len); */
     /* VARARG(exp_name,string); */
+    char __pad_36[4];
 };
 
 
@@ -2608,6 +2727,25 @@ struct flush_key_request
 struct flush_key_reply
 {
     struct reply_header __header;
+    abstime_t   timestamp_counter;
+    data_size_t total;
+    int         branch_count;
+    /* VARARG(data,bytes); */
+};
+
+
+
+struct flush_key_done_request
+{
+    struct request_header __header;
+    char __pad_12[4];
+    abstime_t    timestamp_counter;
+    int          branch;
+    char __pad_28[4];
+};
+struct flush_key_done_reply
+{
+    struct reply_header __header;
 };
 
 
@@ -2734,12 +2872,19 @@ struct save_registry_request
 {
     struct request_header __header;
     obj_handle_t hkey;
-    obj_handle_t file;
-    char __pad_20[4];
 };
 struct save_registry_reply
 {
     struct reply_header __header;
+    data_size_t  total;
+    /* VARARG(data,bytes); */
+    char __pad_12[4];
+};
+enum prefix_type
+{
+    PREFIX_UNKNOWN,
+    PREFIX_32BIT,
+    PREFIX_64BIT,
 };
 
 
@@ -3125,7 +3270,22 @@ struct send_hardware_message_reply
     int             new_y;
     char __pad_28[4];
 };
-#define SEND_HWMSG_INJECTED    0x01
+
+
+
+struct track_mouse_from_pointer_request
+{
+    struct request_header __header;
+    user_handle_t   win;
+    unsigned int    msg;
+    unsigned int    pointer_id;
+};
+struct track_mouse_from_pointer_reply
+{
+    struct reply_header __header;
+    int             cursor_pos_updated;
+    char __pad_12[4];
+};
 
 
 
@@ -3667,6 +3827,23 @@ struct get_window_children_from_point_reply
 };
 
 
+struct get_window_from_point_request
+{
+    struct request_header __header;
+    user_handle_t  parent;
+    int            x;
+    int            y;
+    int            dpi;
+    char __pad_28[4];
+};
+struct get_window_from_point_reply
+{
+    struct reply_header __header;
+    user_handle_t  handle;
+    unsigned int   style;
+};
+
+
 
 struct get_window_tree_request
 {
@@ -3711,6 +3888,7 @@ struct set_window_pos_reply
 #define SET_WINPOS_PAINT_SURFACE    0x01
 #define SET_WINPOS_PIXEL_FORMAT     0x02
 #define SET_WINPOS_LAYERED_WINDOW   0x04
+#define SET_WINPOS_CLIP_CLIENT      0x08
 
 
 struct get_window_rectangles_request
@@ -3725,6 +3903,8 @@ struct get_window_rectangles_reply
     struct reply_header __header;
     struct rectangle window;
     struct rectangle client;
+    unsigned int     style;
+    char __pad_44[4];
 };
 enum coords_relative
 {
@@ -3833,7 +4013,6 @@ struct set_window_region_reply
 {
     struct reply_header __header;
 };
-
 
 
 struct get_update_region_request
@@ -4148,6 +4327,29 @@ struct get_thread_desktop_reply
 };
 
 
+struct get_thread_layout_request
+{
+    struct request_header __header;
+    thread_id_t tid;
+};
+struct get_thread_layout_reply
+{
+    struct reply_header __header;
+    client_ptr_t layout;
+};
+
+
+struct set_thread_layout_request
+{
+    struct request_header __header;
+    thread_id_t tid;
+    client_ptr_t layout;
+};
+struct set_thread_layout_reply
+{
+    struct reply_header __header;
+};
+
 
 struct set_thread_desktop_request
 {
@@ -4168,6 +4370,7 @@ struct set_user_object_info_request
     obj_handle_t handle;
     unsigned int flags;
     unsigned int obj_flags;
+    timeout_t    close_timeout;
 };
 struct set_user_object_info_reply
 {
@@ -4178,6 +4381,7 @@ struct set_user_object_info_reply
 };
 #define SET_USER_OBJECT_SET_FLAGS       1
 #define SET_USER_OBJECT_GET_FULL_NAME   2
+#define SET_USER_OBJECT_SET_CLOSE_TIMEOUT 4
 
 
 
@@ -4244,12 +4448,14 @@ struct get_thread_input_reply
 
 
 
-struct get_last_input_time_request
+struct set_user_input_time_request
 {
     struct request_header __header;
-    char __pad_12[4];
+    int          set;
+    user_handle_t forward;
+    char __pad_20[4];
 };
-struct get_last_input_time_reply
+struct set_user_input_time_reply
 {
     struct reply_header __header;
     unsigned int time;
@@ -4994,11 +5200,13 @@ struct get_security_object_reply
 
 struct handle_info
 {
+    client_ptr_t object;
     process_id_t owner;
     obj_handle_t handle;
     unsigned int access;
     unsigned int attributes;
     unsigned int type;
+    unsigned int __pad;
 };
 
 
@@ -5133,6 +5341,20 @@ struct get_directory_entries_reply
     /* VARARG(entries,directory_entries); */
 };
 
+struct query_directory_file_request
+{
+    struct request_header __header;
+    obj_handle_t   handle;
+    unsigned int   restart_scan;
+    char __pad_20[4];
+};
+struct query_directory_file_reply
+{
+    struct reply_header __header;
+    data_size_t    total_len;
+    /* VARARG(entries,directory_file_entries); */
+    char __pad_12[4];
+};
 
 
 struct create_symlink_request
@@ -5271,6 +5493,40 @@ struct create_device_manager_reply
 
 
 
+struct set_sony_active_controller_request
+{
+    struct request_header __header;
+    unsigned int container0;
+    unsigned int container1;
+    unsigned int container2;
+    unsigned int container3;
+    int          valid;
+};
+struct set_sony_active_controller_reply
+{
+    struct reply_header __header;
+};
+
+
+
+struct get_sony_active_controller_request
+{
+    struct request_header __header;
+    char __pad_12[4];
+};
+struct get_sony_active_controller_reply
+{
+    struct reply_header __header;
+    unsigned int container0;
+    unsigned int container1;
+    unsigned int container2;
+    unsigned int container3;
+    int          valid;
+    char __pad_28[4];
+};
+
+
+
 struct create_device_request
 {
     struct request_header __header;
@@ -5404,6 +5660,7 @@ struct make_process_system_request
 {
     struct request_header __header;
     obj_handle_t handle;
+    timeout_t    desktop_close_timeout;
 };
 struct make_process_system_reply
 {
@@ -6000,6 +6257,8 @@ struct get_inproc_sync_fd_reply
     struct reply_header __header;
     int           type;
     unsigned int access;
+    unsigned int fsync_shm_idx;
+    char __pad_20[4];
 };
 
 
@@ -6013,7 +6272,7 @@ struct get_inproc_alert_fd_reply
 {
     struct reply_header __header;
     obj_handle_t handle;
-    char __pad_12[4];
+    unsigned int fsync_shm_idx;
 };
 
 
@@ -6160,6 +6419,124 @@ struct d3dkmt_mutex_release_reply
 };
 
 
+#define FSYNC_SHM_PAGE_SIZE 0x10000
+#define FSYNC_USED_BY_SERVER 0x7eadfeef
+
+enum fsync_type
+{
+    FSYNC_SEMAPHORE = 1,
+    FSYNC_AUTO_EVENT,
+    FSYNC_MANUAL_EVENT,
+    FSYNC_MUTEX,
+    FSYNC_AUTO_SERVER,
+    FSYNC_MANUAL_SERVER,
+    FSYNC_QUEUE,
+};
+
+struct fsync_free_shm_idx_request
+{
+    struct request_header __header;
+    unsigned int shm_idx;
+};
+struct fsync_free_shm_idx_reply
+{
+    struct reply_header __header;
+};
+
+
+
+struct hwnd_list_dmabuf_frames_request
+{
+    struct request_header __header;
+    user_handle_t  host_hwnd;
+};
+struct hwnd_list_dmabuf_frames_reply
+{
+    struct reply_header __header;
+    unsigned int   status;
+    unsigned int   count;
+    /* VARARG(frames,bytes); */
+};
+
+
+
+struct hwnd_dmabuf_set_pending_request
+{
+    struct request_header __header;
+    user_handle_t  hwnd;
+    unsigned int   pending;
+    char __pad_20[4];
+};
+struct hwnd_dmabuf_set_pending_reply
+{
+    struct reply_header __header;
+    unsigned int   status;
+    char __pad_12[4];
+};
+
+
+
+struct hwnd_dmabuf_get_channel_request
+{
+    struct request_header __header;
+    user_handle_t  hwnd;
+    unsigned int   flags;
+    char __pad_20[4];
+};
+struct hwnd_dmabuf_get_channel_reply
+{
+    struct reply_header __header;
+    unsigned int   status;
+    obj_handle_t   channel_handle;
+};
+
+
+
+struct hwnd_dmabuf_get_channel_exclusive_request
+{
+    struct request_header __header;
+    user_handle_t  hwnd;
+};
+struct hwnd_dmabuf_get_channel_exclusive_reply
+{
+    struct reply_header __header;
+    unsigned int   status;
+    obj_handle_t   channel_handle;
+};
+
+
+
+struct hwnd_dmabuf_claim_channel_request
+{
+    struct request_header __header;
+    user_handle_t  hwnd;
+    unsigned int   flags;
+    char __pad_20[4];
+};
+struct hwnd_dmabuf_claim_channel_reply
+{
+    struct reply_header __header;
+    unsigned int   status;
+    obj_handle_t   channel_handle;
+};
+
+
+
+struct hwnd_dmabuf_release_channel_request
+{
+    struct request_header __header;
+    user_handle_t  hwnd;
+    unsigned int   flags;
+    char __pad_20[4];
+};
+struct hwnd_dmabuf_release_channel_reply
+{
+    struct reply_header __header;
+    unsigned int   status;
+    char __pad_12[4];
+};
+
+
 enum request
 {
     REQ_new_process,
@@ -6252,6 +6629,7 @@ enum request
     REQ_open_key,
     REQ_delete_key,
     REQ_flush_key,
+    REQ_flush_key_done,
     REQ_enum_key,
     REQ_set_key_value,
     REQ_get_key_value,
@@ -6284,6 +6662,7 @@ enum request
     REQ_send_message,
     REQ_post_quit_message,
     REQ_send_hardware_message,
+    REQ_track_mouse_from_pointer,
     REQ_get_message,
     REQ_reply_message,
     REQ_accept_hardware_message,
@@ -6316,6 +6695,7 @@ enum request
     REQ_get_window_list,
     REQ_get_class_windows,
     REQ_get_window_children_from_point,
+    REQ_get_window_from_point,
     REQ_get_window_tree,
     REQ_set_window_pos,
     REQ_get_window_rectangles,
@@ -6345,13 +6725,15 @@ enum request
     REQ_set_input_desktop,
     REQ_close_desktop,
     REQ_get_thread_desktop,
+    REQ_get_thread_layout,
+    REQ_set_thread_layout,
     REQ_set_thread_desktop,
     REQ_set_user_object_info,
     REQ_register_hotkey,
     REQ_unregister_hotkey,
     REQ_attach_thread_input,
     REQ_get_thread_input,
-    REQ_get_last_input_time,
+    REQ_set_user_input_time,
     REQ_get_key_state,
     REQ_set_key_state,
     REQ_set_foreground_window,
@@ -6404,6 +6786,7 @@ enum request
     REQ_create_directory,
     REQ_open_directory,
     REQ_get_directory_entries,
+    REQ_query_directory_file,
     REQ_create_symlink,
     REQ_open_symlink,
     REQ_query_symlink,
@@ -6413,6 +6796,8 @@ enum request
     REQ_get_object_types,
     REQ_allocate_locally_unique_id,
     REQ_create_device_manager,
+    REQ_set_sony_active_controller,
+    REQ_get_sony_active_controller,
     REQ_create_device,
     REQ_delete_device,
     REQ_get_next_device_request,
@@ -6468,6 +6853,13 @@ enum request
     REQ_d3dkmt_object_open_name,
     REQ_d3dkmt_mutex_acquire,
     REQ_d3dkmt_mutex_release,
+    REQ_fsync_free_shm_idx,
+    REQ_hwnd_list_dmabuf_frames,
+    REQ_hwnd_dmabuf_set_pending,
+    REQ_hwnd_dmabuf_get_channel,
+    REQ_hwnd_dmabuf_get_channel_exclusive,
+    REQ_hwnd_dmabuf_claim_channel,
+    REQ_hwnd_dmabuf_release_channel,
     REQ_NB_REQUESTS
 };
 
@@ -6565,6 +6957,7 @@ union generic_request
     struct open_key_request open_key_request;
     struct delete_key_request delete_key_request;
     struct flush_key_request flush_key_request;
+    struct flush_key_done_request flush_key_done_request;
     struct enum_key_request enum_key_request;
     struct set_key_value_request set_key_value_request;
     struct get_key_value_request get_key_value_request;
@@ -6597,6 +6990,7 @@ union generic_request
     struct send_message_request send_message_request;
     struct post_quit_message_request post_quit_message_request;
     struct send_hardware_message_request send_hardware_message_request;
+    struct track_mouse_from_pointer_request track_mouse_from_pointer_request;
     struct get_message_request get_message_request;
     struct reply_message_request reply_message_request;
     struct accept_hardware_message_request accept_hardware_message_request;
@@ -6629,6 +7023,7 @@ union generic_request
     struct get_window_list_request get_window_list_request;
     struct get_class_windows_request get_class_windows_request;
     struct get_window_children_from_point_request get_window_children_from_point_request;
+    struct get_window_from_point_request get_window_from_point_request;
     struct get_window_tree_request get_window_tree_request;
     struct set_window_pos_request set_window_pos_request;
     struct get_window_rectangles_request get_window_rectangles_request;
@@ -6658,13 +7053,15 @@ union generic_request
     struct set_input_desktop_request set_input_desktop_request;
     struct close_desktop_request close_desktop_request;
     struct get_thread_desktop_request get_thread_desktop_request;
+    struct get_thread_layout_request get_thread_layout_request;
+    struct set_thread_layout_request set_thread_layout_request;
     struct set_thread_desktop_request set_thread_desktop_request;
     struct set_user_object_info_request set_user_object_info_request;
     struct register_hotkey_request register_hotkey_request;
     struct unregister_hotkey_request unregister_hotkey_request;
     struct attach_thread_input_request attach_thread_input_request;
     struct get_thread_input_request get_thread_input_request;
-    struct get_last_input_time_request get_last_input_time_request;
+    struct set_user_input_time_request set_user_input_time_request;
     struct get_key_state_request get_key_state_request;
     struct set_key_state_request set_key_state_request;
     struct set_foreground_window_request set_foreground_window_request;
@@ -6717,6 +7114,7 @@ union generic_request
     struct create_directory_request create_directory_request;
     struct open_directory_request open_directory_request;
     struct get_directory_entries_request get_directory_entries_request;
+    struct query_directory_file_request query_directory_file_request;
     struct create_symlink_request create_symlink_request;
     struct open_symlink_request open_symlink_request;
     struct query_symlink_request query_symlink_request;
@@ -6726,6 +7124,8 @@ union generic_request
     struct get_object_types_request get_object_types_request;
     struct allocate_locally_unique_id_request allocate_locally_unique_id_request;
     struct create_device_manager_request create_device_manager_request;
+    struct set_sony_active_controller_request set_sony_active_controller_request;
+    struct get_sony_active_controller_request get_sony_active_controller_request;
     struct create_device_request create_device_request;
     struct delete_device_request delete_device_request;
     struct get_next_device_request_request get_next_device_request_request;
@@ -6781,6 +7181,13 @@ union generic_request
     struct d3dkmt_object_open_name_request d3dkmt_object_open_name_request;
     struct d3dkmt_mutex_acquire_request d3dkmt_mutex_acquire_request;
     struct d3dkmt_mutex_release_request d3dkmt_mutex_release_request;
+    struct fsync_free_shm_idx_request fsync_free_shm_idx_request;
+    struct hwnd_list_dmabuf_frames_request hwnd_list_dmabuf_frames_request;
+    struct hwnd_dmabuf_set_pending_request hwnd_dmabuf_set_pending_request;
+    struct hwnd_dmabuf_get_channel_request hwnd_dmabuf_get_channel_request;
+    struct hwnd_dmabuf_get_channel_exclusive_request hwnd_dmabuf_get_channel_exclusive_request;
+    struct hwnd_dmabuf_claim_channel_request hwnd_dmabuf_claim_channel_request;
+    struct hwnd_dmabuf_release_channel_request hwnd_dmabuf_release_channel_request;
 };
 union generic_reply
 {
@@ -6876,6 +7283,7 @@ union generic_reply
     struct open_key_reply open_key_reply;
     struct delete_key_reply delete_key_reply;
     struct flush_key_reply flush_key_reply;
+    struct flush_key_done_reply flush_key_done_reply;
     struct enum_key_reply enum_key_reply;
     struct set_key_value_reply set_key_value_reply;
     struct get_key_value_reply get_key_value_reply;
@@ -6908,6 +7316,7 @@ union generic_reply
     struct send_message_reply send_message_reply;
     struct post_quit_message_reply post_quit_message_reply;
     struct send_hardware_message_reply send_hardware_message_reply;
+    struct track_mouse_from_pointer_reply track_mouse_from_pointer_reply;
     struct get_message_reply get_message_reply;
     struct reply_message_reply reply_message_reply;
     struct accept_hardware_message_reply accept_hardware_message_reply;
@@ -6940,6 +7349,7 @@ union generic_reply
     struct get_window_list_reply get_window_list_reply;
     struct get_class_windows_reply get_class_windows_reply;
     struct get_window_children_from_point_reply get_window_children_from_point_reply;
+    struct get_window_from_point_reply get_window_from_point_reply;
     struct get_window_tree_reply get_window_tree_reply;
     struct set_window_pos_reply set_window_pos_reply;
     struct get_window_rectangles_reply get_window_rectangles_reply;
@@ -6969,13 +7379,15 @@ union generic_reply
     struct set_input_desktop_reply set_input_desktop_reply;
     struct close_desktop_reply close_desktop_reply;
     struct get_thread_desktop_reply get_thread_desktop_reply;
+    struct get_thread_layout_reply get_thread_layout_reply;
+    struct set_thread_layout_reply set_thread_layout_reply;
     struct set_thread_desktop_reply set_thread_desktop_reply;
     struct set_user_object_info_reply set_user_object_info_reply;
     struct register_hotkey_reply register_hotkey_reply;
     struct unregister_hotkey_reply unregister_hotkey_reply;
     struct attach_thread_input_reply attach_thread_input_reply;
     struct get_thread_input_reply get_thread_input_reply;
-    struct get_last_input_time_reply get_last_input_time_reply;
+    struct set_user_input_time_reply set_user_input_time_reply;
     struct get_key_state_reply get_key_state_reply;
     struct set_key_state_reply set_key_state_reply;
     struct set_foreground_window_reply set_foreground_window_reply;
@@ -7028,6 +7440,7 @@ union generic_reply
     struct create_directory_reply create_directory_reply;
     struct open_directory_reply open_directory_reply;
     struct get_directory_entries_reply get_directory_entries_reply;
+    struct query_directory_file_reply query_directory_file_reply;
     struct create_symlink_reply create_symlink_reply;
     struct open_symlink_reply open_symlink_reply;
     struct query_symlink_reply query_symlink_reply;
@@ -7037,6 +7450,8 @@ union generic_reply
     struct get_object_types_reply get_object_types_reply;
     struct allocate_locally_unique_id_reply allocate_locally_unique_id_reply;
     struct create_device_manager_reply create_device_manager_reply;
+    struct set_sony_active_controller_reply set_sony_active_controller_reply;
+    struct get_sony_active_controller_reply get_sony_active_controller_reply;
     struct create_device_reply create_device_reply;
     struct delete_device_reply delete_device_reply;
     struct get_next_device_request_reply get_next_device_request_reply;
@@ -7092,8 +7507,15 @@ union generic_reply
     struct d3dkmt_object_open_name_reply d3dkmt_object_open_name_reply;
     struct d3dkmt_mutex_acquire_reply d3dkmt_mutex_acquire_reply;
     struct d3dkmt_mutex_release_reply d3dkmt_mutex_release_reply;
+    struct fsync_free_shm_idx_reply fsync_free_shm_idx_reply;
+    struct hwnd_list_dmabuf_frames_reply hwnd_list_dmabuf_frames_reply;
+    struct hwnd_dmabuf_set_pending_reply hwnd_dmabuf_set_pending_reply;
+    struct hwnd_dmabuf_get_channel_reply hwnd_dmabuf_get_channel_reply;
+    struct hwnd_dmabuf_get_channel_exclusive_reply hwnd_dmabuf_get_channel_exclusive_reply;
+    struct hwnd_dmabuf_claim_channel_reply hwnd_dmabuf_claim_channel_reply;
+    struct hwnd_dmabuf_release_channel_reply hwnd_dmabuf_release_channel_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 930
+#define SERVER_PROTOCOL_VERSION 938
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

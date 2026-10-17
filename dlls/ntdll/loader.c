@@ -43,6 +43,7 @@ WINE_DECLARE_DEBUG_CHANNEL(relay);
 WINE_DECLARE_DEBUG_CHANNEL(snoop);
 WINE_DECLARE_DEBUG_CHANNEL(loaddll);
 WINE_DECLARE_DEBUG_CHANNEL(imports);
+WINE_DECLARE_DEBUG_CHANNEL(winediag);
 
 #ifdef _WIN64
 #define DEFAULT_SECURITY_COOKIE_64  (((ULONGLONG)0x00002b99 << 32) | 0x2ddfa232)
@@ -88,9 +89,14 @@ static const WCHAR system_dir[] = L"C:\\windows\\system32\\";
 /* system search path */
 static const WCHAR system_path[] = L"C:\\windows\\system32;C:\\windows\\system;C:\\windows;C:\\Program Files (x86)\\Steam";
 
+#define IS_OPTION_TRUE(ch) ((ch) == 'y' || (ch) == 'Y' || (ch) == 't' || (ch) == 'T' || (ch) == '1')
+
+
 static BOOL is_prefix_bootstrap;  /* are we bootstrapping the prefix? */
 static BOOL imports_fixup_done = FALSE;  /* set once the imports have been fixed up, before attaching them */
 static BOOL process_detaching = FALSE;  /* set on process detach to avoid deadlocks with thread detach */
+static BOOL process_exiting;           /* RtlExitUserProcess has terminated the other threads */
+static DWORD process_exit_status;
 static int free_lib_count;   /* recursion depth of LdrUnloadDll calls */
 static LONG path_safe_mode;  /* path mode set by RtlSetSearchPathMode */
 static LONG dll_safe_mode = 1;  /* dll search mode */
@@ -107,6 +113,8 @@ struct dll_dir_entry
 };
 
 static struct list dll_dir_list = LIST_INIT( dll_dir_list );  /* extra dirs from LdrAddDllDirectory */
+
+static BOOL hide_wine_exports = FALSE;  /* try to hide ntdll wine exports from applications */
 
 struct ldr_notification
 {
@@ -141,6 +149,7 @@ typedef struct _wine_modref
     struct file_id        id;
     ULONG                 CheckSum;
     BOOL                  system;
+    void                 *ai_limit_compute_thunk;
 } WINE_MODREF;
 
 static UINT tls_module_count = 32;     /* number of modules with TLS directory */
@@ -1758,6 +1767,211 @@ static void call_tls_callbacks( HMODULE module, UINT reason )
     }
 }
 
+#if defined(__x86_64__) && !defined(__arm64ec__)
+typedef BYTE *(WINAPI *unity_get_gfx_device_func)(void);
+typedef void *(WINAPI *unity_select_compute_variant_func)(BYTE *shader);
+
+static void *WINAPI ai_limit_select_compute_variant( BYTE *shader, unity_get_gfx_device_func get_device,
+                                                     unity_select_compute_variant_func select_variant )
+{
+    BYTE *device = get_device(), *variants, *dx11 = NULL;
+    SIZE_T count, i;
+
+    if (!device || *(UINT *)(device + 0x1e84) != 18) return select_variant( shader );
+
+    variants = *(BYTE **)(shader + 0x38);
+    count = *(SIZE_T *)(shader + 0x48);
+    for (i = 0; i < count; ++i)
+    {
+        BYTE *variant = variants + i * 0x50;
+
+        /* Never replace a native DX12 entry, even if its kernel list is empty. */
+        if (*(UINT *)variant == 18) return select_variant( shader );
+        if (*(UINT *)variant == 2 && !*(UINT *)(variant + 4) && *(SIZE_T *)(variant + 0x18))
+            dx11 = variant;
+    }
+
+    /* The inspected DX11 entries contain DXBC cs_5_0 programs usable by DX12.
+     * Return the owned entry without copying its vectors or changing the device. */
+    return dx11 ? dx11 : select_variant( shader );
+}
+
+#include "pshpack1.h"
+struct ai_limit_compute_thunk
+{
+    BYTE mov_rdx[2];
+    unity_get_gfx_device_func get_device;
+    BYTE mov_r8[2];
+    unity_select_compute_variant_func select_variant;
+    BYTE jump[6];
+    void *hook;
+    BYTE original[20];
+    BYTE return_jump[6];
+    void *return_address;
+};
+#include "poppack.h"
+
+C_ASSERT(offsetof(struct ai_limit_compute_thunk, original) == 34);
+C_ASSERT(sizeof(struct ai_limit_compute_thunk) == 68);
+
+static void patch_ai_limit_compute_shaders( WINE_MODREF *wm )
+{
+    static const BYTE jump[] = {0xff, 0x25, 0, 0, 0, 0};
+    struct ai_limit_compute_thunk *thunk;
+    BYTE *base = wm->ldr.DllBase, *target = base + 0x6049a0;
+    const WCHAR *app, *p;
+    void *allocation = NULL, *address;
+    SIZE_T size;
+    ULONG old_protect, unused;
+    NTSTATUS status;
+
+    if (wm->ai_limit_compute_thunk || (wm->ldr.Flags & LDR_WINE_INTERNAL) ||
+        wcsicmp( wm->ldr.BaseDllName.Buffer, L"UnityPlayer.dll" )) return;
+    app = NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer;
+    if ((p = wcsrchr( app, '\\' ))) app = p + 1;
+    if ((p = wcsrchr( app, '/' ))) app = p + 1;
+    if (wcsicmp( app, L"AI-LIMIT.exe" )) return;
+
+    /* AI LIMIT's Unity 2022.3.39f1. Check the complete selector and device
+     * getter before relying on their private layout or relocating the prologue.
+     * These code ranges have no base relocations. Unknown builds stay untouched. */
+    if (wm->ldr.TimeDateStamp != 0x6696cce1 || wm->ldr.SizeOfImage != 0x1e57000 ||
+        RtlImageNtHeader( wm->ldr.DllBase )->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
+        RtlComputeCrc32( 0, target, 0x259 ) != 0xcf04ef1f ||
+        RtlComputeCrc32( 0, base + 0x705e80, 0xe5 ) != 0xeb25b6f4)
+    {
+        WARN_(loaddll)("AI LIMIT: skipping DX12 compute fallback for an unrecognized UnityPlayer.dll.\n");
+        return;
+    }
+
+    size = sizeof(*thunk);
+    status = NtAllocateVirtualMemory( NtCurrentProcess(), &allocation, 0, &size,
+                                      MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE );
+    if (status) goto failed;
+    thunk = allocation;
+    thunk->mov_rdx[0] = 0x48;
+    thunk->mov_rdx[1] = 0xba;
+    thunk->get_device = (unity_get_gfx_device_func)(base + 0x705e80);
+    thunk->mov_r8[0] = 0x49;
+    thunk->mov_r8[1] = 0xb8;
+    thunk->select_variant = (unity_select_compute_variant_func)thunk->original;
+    memcpy( thunk->jump, jump, sizeof(jump) );
+    thunk->hook = ai_limit_select_compute_variant;
+    /* Four complete MOVs save nonvolatile registers in the caller's home area.
+     * They are position independent and leave RSP unchanged. The rest of Unity's
+     * prologue and its original unwind information remain at their original RVAs. */
+    memcpy( thunk->original, target, sizeof(thunk->original) );
+    memcpy( thunk->return_jump, jump, sizeof(jump) );
+    thunk->return_address = target + sizeof(thunk->original);
+
+    address = allocation;
+    size = sizeof(*thunk);
+    status = NtProtectVirtualMemory( NtCurrentProcess(), &address, &size, PAGE_EXECUTE_READ, &unused );
+    if (status) goto failed;
+    status = NtFlushInstructionCache( NtCurrentProcess(), allocation, sizeof(*thunk) );
+    if (status) goto failed;
+
+    address = target;
+    size = sizeof(jump) + sizeof(allocation);
+    status = NtProtectVirtualMemory( NtCurrentProcess(), &address, &size, PAGE_EXECUTE_READWRITE, &old_protect );
+    if (status) goto failed;
+    /* Install under the loader lock, before this module's TLS callbacks/DllMain. */
+    memcpy( target, jump, sizeof(jump) );
+    memcpy( target + sizeof(jump), &allocation, sizeof(allocation) );
+    status = NtFlushInstructionCache( NtCurrentProcess(), target, sizeof(thunk->original) );
+    if (!status)
+        status = NtProtectVirtualMemory( NtCurrentProcess(), &address, &size, old_protect, &unused );
+    if (status)
+    {
+        memcpy( target, thunk->original, sizeof(thunk->original) );
+        NtFlushInstructionCache( NtCurrentProcess(), target, sizeof(thunk->original) );
+        NtProtectVirtualMemory( NtCurrentProcess(), &address, &size, old_protect, &unused );
+        goto failed;
+    }
+    wm->ai_limit_compute_thunk = allocation;
+    TRACE_(loaddll)("AI LIMIT: enabled DX12 compute-shader fallback for Unity 2022.3.39f1.\n");
+    return;
+
+failed:
+    if (allocation)
+    {
+        size = 0;
+        NtFreeVirtualMemory( NtCurrentProcess(), &allocation, &size, MEM_RELEASE );
+    }
+    WARN_(loaddll)("AI LIMIT: could not install DX12 compute-shader fallback, status %#lx.\n", status);
+}
+#else
+static void patch_ai_limit_compute_shaders( WINE_MODREF *wm ) {}
+#endif
+
+#ifdef __i386__
+static void patch_max_payne_cpu_detection( WINE_MODREF *wm )
+{
+    static const BYTE expected[] =
+    {
+        0x66, 0x60, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x0f, 0xa2,
+        0x89, 0x45, 0xdc, 0x88, 0x5d, 0xc0, 0x88, 0x7d, 0xc1,
+        0xc1, 0xeb, 0x10, 0x88, 0x5d, 0xc2, 0x88, 0x7d, 0xc3,
+        0x88, 0x55, 0xc4, 0x88, 0x75, 0xc5, 0xc1, 0xea, 0x10,
+        0x88, 0x55, 0xc6, 0x88, 0x75, 0xc7, 0x88, 0x4d, 0xc8,
+        0x88, 0x6d, 0xc9, 0xc1, 0xe9, 0x10, 0x88, 0x4d, 0xca,
+        0x88, 0x6d, 0xcb, 0xc6, 0x45, 0xcc, 0x00, 0x85, 0xc0,
+        0x66, 0x61, 0x8b, 0x45, 0xdc, 0x83, 0xe0, 0x0f,
+        0x89, 0x45, 0xdc, 0x0f, 0x84, 0x92, 0x12, 0x00, 0x00,
+        0x83, 0xf8, 0x01, 0x72, 0x38, 0x66, 0x60,
+    };
+    static const BYTE replacement[] = {0x85, 0xc0, 0x90}; /* test eax,eax; nop */
+    BYTE *base = wm->ldr.DllBase, *target;
+    const WCHAR *app, *p;
+    void *address;
+    SIZE_T size;
+    ULONG old_protect, unused;
+    NTSTATUS status;
+
+    if ((wm->ldr.Flags & LDR_WINE_INTERNAL) || wcsicmp( wm->ldr.BaseDllName.Buffer, L"rlmfc.dll" )) return;
+    app = NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer;
+    if ((p = wcsrchr( app, '\\' ))) app = p + 1;
+    if ((p = wcsrchr( app, '/' ))) app = p + 1;
+    if (wcsicmp( app, L"maxpayne.exe" )) return;
+
+    /* LuigoAlma identified the erroneous CPUID(0).EAX & 0xf test in rlmfc.
+     * Keep the full leaf count so 0x10 does not select the broken scalar path.
+     * Verify the relocation-free instruction sequence before changing it. */
+    if (wm->ldr.TimeDateStamp != 0x3c03ab3e || wm->ldr.SizeOfImage != 0x67000 ||
+        RtlImageNtHeader( wm->ldr.DllBase )->FileHeader.Machine != IMAGE_FILE_MACHINE_I386 ||
+        memcmp( base + 0x256a9, expected, sizeof(expected) ))
+    {
+        TRACE_(loaddll)("Max Payne: skipping CPU detection fix for an unrecognized rlmfc.dll.\n");
+        return;
+    }
+
+    target = base + 0x256ed;
+    address = target;
+    size = sizeof(replacement);
+    status = NtProtectVirtualMemory( NtCurrentProcess(), &address, &size, PAGE_EXECUTE_READWRITE, &old_protect );
+    if (status) goto failed;
+    /* Called under the loader lock, before rlmfc's TLS callbacks or DllMain. */
+    memcpy( target, replacement, sizeof(replacement) );
+    status = NtFlushInstructionCache( NtCurrentProcess(), target, sizeof(replacement) );
+    if (!status)
+        status = NtProtectVirtualMemory( NtCurrentProcess(), &address, &size, old_protect, &unused );
+    if (status)
+    {
+        memcpy( target, expected + 0x256ed - 0x256a9, sizeof(replacement) );
+        NtFlushInstructionCache( NtCurrentProcess(), target, sizeof(replacement) );
+        NtProtectVirtualMemory( NtCurrentProcess(), &address, &size, old_protect, &unused );
+        goto failed;
+    }
+    TRACE_(loaddll)("Max Payne: fixed rlmfc.dll CPU detection for JPEG loading.\n");
+    return;
+
+failed:
+    WARN_(loaddll)("Max Payne: could not fix rlmfc.dll CPU detection, status %#lx.\n", status);
+}
+#else
+static void patch_max_payne_cpu_detection( WINE_MODREF *wm ) {}
+#endif
+
 /*************************************************************************
  *              MODULE_InitDLL
  */
@@ -1772,6 +1986,8 @@ static NTSTATUS MODULE_InitDLL( WINE_MODREF *wm, UINT reason, LPVOID lpReserved 
     /* Skip calls for modules loaded with special load flags */
 
     if (wm->ldr.Flags & (LDR_DONT_RESOLVE_REFS | LDR_DONT_CALL_DLLMAIN)) return STATUS_SUCCESS;
+    if (reason == DLL_PROCESS_ATTACH) patch_ai_limit_compute_shaders( wm );
+    if (reason == DLL_PROCESS_ATTACH) patch_max_payne_cpu_detection( wm );
     if (wm->ldr.TlsIndex == -1) call_tls_callbacks( wm->ldr.DllBase, reason );
     if (!entry) return STATUS_SUCCESS;
 
@@ -2144,6 +2360,96 @@ NTSTATUS WINAPI LdrUnlockLoaderLock( ULONG flags, ULONG_PTR magic )
 }
 
 
+/***********************************************************************
+ *           hidden_exports_init
+ *
+ * Initializes the hide_wine_exports options.
+ */
+static void hidden_exports_init( const WCHAR *appname )
+{
+    static const WCHAR configW[] = {'S','o','f','t','w','a','r','e','\\','W','i','n','e',0};
+    static const WCHAR appdefaultsW[] = {'A','p','p','D','e','f','a','u','l','t','s','\\',0};
+    static const WCHAR hideWineExports[] = {'H','i','d','e','W','i','n','e','E','x','p','o','r','t','s',0};
+    OBJECT_ATTRIBUTES attr;
+    UNICODE_STRING nameW;
+    HANDLE root, config_key, hkey;
+    BOOL got_hide_wine_exports = FALSE;
+    char tmp[80];
+    DWORD dummy;
+
+    RtlOpenCurrentUser( KEY_ALL_ACCESS, &root );
+    attr.Length = sizeof(attr);
+    attr.RootDirectory = root;
+    attr.ObjectName = &nameW;
+    attr.Attributes = OBJ_CASE_INSENSITIVE;
+    attr.SecurityDescriptor = NULL;
+    attr.SecurityQualityOfService = NULL;
+    RtlInitUnicodeString( &nameW, configW );
+
+    /* @@ Wine registry key: HKCU\Software\Wine */
+    if (NtOpenKey( &config_key, KEY_QUERY_VALUE, &attr )) config_key = 0;
+    NtClose( root );
+    if (!config_key) return;
+
+    if (appname && *appname)
+    {
+        const WCHAR *p;
+        WCHAR appversion[MAX_PATH+20];
+
+        if ((p = wcsrchr( appname, '/' ))) appname = p + 1;
+        if ((p = wcsrchr( appname, '\\' ))) appname = p + 1;
+
+        wcscpy( appversion, appdefaultsW );
+        wcscat( appversion, appname );
+        RtlInitUnicodeString( &nameW, appversion );
+        attr.RootDirectory = config_key;
+
+        /* @@ Wine registry key: HKCU\Software\Wine\AppDefaults\app.exe */
+        if (!NtOpenKey( &hkey, KEY_QUERY_VALUE, &attr ))
+        {
+            TRACE( "getting HideWineExports from %s\n", debugstr_w(appversion) );
+
+            RtlInitUnicodeString( &nameW, hideWineExports );
+            if (!NtQueryValueKey( hkey, &nameW, KeyValuePartialInformation, tmp, sizeof(tmp), &dummy ))
+            {
+                WCHAR *str = (WCHAR *)((KEY_VALUE_PARTIAL_INFORMATION *)tmp)->Data;
+                hide_wine_exports = IS_OPTION_TRUE( str[0] );
+                got_hide_wine_exports = TRUE;
+            }
+
+            NtClose( hkey );
+        }
+    }
+
+    if (!got_hide_wine_exports)
+    {
+        TRACE( "getting default HideWineExports\n" );
+
+        RtlInitUnicodeString( &nameW, hideWineExports );
+        if (!NtQueryValueKey( config_key, &nameW, KeyValuePartialInformation, tmp, sizeof(tmp), &dummy ))
+        {
+            WCHAR *str = (WCHAR *)((KEY_VALUE_PARTIAL_INFORMATION *)tmp)->Data;
+            hide_wine_exports = IS_OPTION_TRUE( str[0] );
+        }
+    }
+
+    NtClose( config_key );
+}
+
+
+/***********************************************************************
+ *           is_hidden_export
+ *
+ * Checks if a specific export should be hidden.
+ */
+static BOOL is_hidden_export( void *proc )
+{
+    return hide_wine_exports && (proc == &wine_get_version ||
+                                 proc == &wine_get_build_id ||
+                                 proc == &wine_get_host_version);
+}
+
+
 /******************************************************************
  *		LdrGetProcedureAddress  (NTDLL.@)
  */
@@ -2164,7 +2470,7 @@ NTSTATUS WINAPI LdrGetProcedureAddress(HMODULE module, const ANSI_STRING *name,
     {
         void *proc = name ? find_named_export( module, exports, exp_size, name->Buffer, -1, NULL, wm, TRUE )
                           : find_ordinal_export( module, exports, exp_size, ord - exports->Base, NULL, wm, TRUE );
-        if (proc)
+        if (proc && !is_hidden_export( proc ))
         {
             *address = proc;
             ret = STATUS_SUCCESS;
@@ -2492,6 +2798,8 @@ static void build_ntdll_module(void)
     node_ntdll = wm->ldr.DdagNode;
     if (TRACE_ON(relay)) RELAY_SetupDLL( module );
     TRACE_(loaddll)( "Loaded %s at %p: builtin\n", debugstr_w(wm->ldr.FullDllName.Buffer), module);
+
+    hidden_exports_init( wm->ldr.FullDllName.Buffer );
 }
 
 
@@ -3501,6 +3809,48 @@ static NTSTATUS find_dll_file( const WCHAR *load_path, const WCHAR *libname, UNI
 
 
 /***********************************************************************
+ *	load_dll_optiscaler_hack
+ *
+ * Very silly hack to inject optiscaler
+ */
+BOOL load_dll_optiscaler_hack(LPCWSTR name, LPWSTR override, DWORD size)
+{
+    static WCHAR dllW[32] = {0};
+    static INT cached = -1;
+    UNICODE_STRING overrideW;
+    OBJECT_ATTRIBUTES attr;
+    IO_STATUS_BLOCK io;
+    NTSTATUS status;
+    HANDLE handle;
+
+    if ( cached == -1 ) {
+        cached = get_env( L"WINE_OPTISCALER_NAME", dllW, sizeof(dllW));
+        if ( !cached ) return FALSE;
+    }
+
+    if ( cached && !_wcsicmp( name, dllW ) )
+    {
+        swprintf( override, size, L"\\??\\c:\\windows\\system32\\umu\\%s", dllW );
+        if ( cached != 2 )
+        {
+            RtlInitUnicodeString( &overrideW, override );
+            InitializeObjectAttributes( &attr, &overrideW, OBJ_CASE_INSENSITIVE, 0, NULL );
+            status = NtOpenFile( &handle, GENERIC_READ | SYNCHRONIZE, &attr, &io,
+                                 FILE_SHARE_READ | FILE_SHARE_DELETE,
+                                 FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE );
+            TRACE ( "trying to open %s, status=%lx\n", debugstr_w(override), status );
+            NtClose( handle );
+            RtlFreeUnicodeString( &overrideW );
+            if ( !status ) cached = 2;
+        }
+        return cached == 2;
+    }
+
+    return FALSE;
+}
+
+
+/***********************************************************************
  *	load_dll  (internal)
  *
  * Load a PE style module according to the load order.
@@ -3515,6 +3865,8 @@ static NTSTATUS load_dll( const WCHAR *load_path, const WCHAR *libname, DWORD fl
     NTSTATUS nts = STATUS_DLL_NOT_FOUND;
     BOOL redirected;
     void *prev;
+    WCHAR override[260] = {0};
+    BOOL do_override = FALSE;
 
     TRACE( "looking for %s in %s\n", debugstr_w(libname), debugstr_w(load_path) );
 
@@ -3523,7 +3875,9 @@ static NTSTATUS load_dll( const WCHAR *load_path, const WCHAR *libname, DWORD fl
 
     if (nts)
     {
-        nts = find_dll_file( load_path, libname, &nt_name, pwm, &mapping, &image_info, &id,
+        if ( (do_override = load_dll_optiscaler_hack(libname, override, ARRAY_SIZE(override))) )
+            FIXME ( "HACK: redirecting %s to %s\n", debugstr_w(libname), debugstr_w(override) );
+        nts = find_dll_file( load_path, do_override ? override : libname, &nt_name, pwm, &mapping, &image_info, &id,
                              &redirected, FALSE );
         system = FALSE;
     }
@@ -4121,6 +4475,7 @@ void WINAPI LdrShutdownProcess(void)
     process_detach();
 }
 
+extern const char * CDECL wine_get_version(void);
 
 /******************************************************************
  *		RtlExitUserProcess (NTDLL.@)
@@ -4130,8 +4485,18 @@ void WINAPI RtlExitUserProcess( DWORD status )
     RtlEnterCriticalSection( &loader_section );
     RtlAcquirePebLock();
     NtTerminateProcess( 0, status );
+    process_exit_status = status;
+    process_exiting = TRUE;
     LdrShutdownProcess();
     for (;;) NtTerminateProcess( GetCurrentProcess(), status );
+}
+
+/* Called only when acquiring a lock would block. Never run cleanup with
+ * fabricated ownership of a lock left behind by a terminated thread. */
+void terminate_process_on_shutdown(void)
+{
+    if (process_exiting && process_detaching)
+        for (;;) NtTerminateProcess( GetCurrentProcess(), process_exit_status );
 }
 
 /******************************************************************
@@ -4242,6 +4607,11 @@ static void free_modref( WINE_MODREF *wm )
     free_tls_slot( &wm->ldr );
     RtlReleaseActivationContext( wm->ldr.ActivationContext );
     NtUnmapViewOfSection( NtCurrentProcess(), wm->ldr.DllBase );
+    if (wm->ai_limit_compute_thunk)
+    {
+        SIZE_T size = 0;
+        NtFreeVirtualMemory( NtCurrentProcess(), &wm->ai_limit_compute_thunk, &size, MEM_RELEASE );
+    }
     if (cached_modref == wm) cached_modref = NULL;
     RtlFreeUnicodeString( &wm->ldr.FullDllName );
     RtlFreeHeap( GetProcessHeap(), 0, wm );
@@ -4631,6 +5001,9 @@ static void release_address_space(void)
  */
 void loader_init( CONTEXT *context, void **entry )
 {
+    OBJECT_ATTRIBUTES staging_event_attr;
+    UNICODE_STRING staging_event_string;
+    HANDLE staging_event;
     static int attach_done;
     NTSTATUS status;
     ULONG_PTR cookie, port = 0;
@@ -4752,6 +5125,20 @@ void loader_init( CONTEXT *context, void **entry )
         }
 
         wm = get_modref( NtCurrentTeb()->Peb->ImageBaseAddress );
+        /* This hunk occasionally applies in the wrong place;
+         * add a comment here to try to prevent that. */
+    }
+    RtlInitUnicodeString( &staging_event_string, L"\\__wine_staging_warn_event" );
+    InitializeObjectAttributes( &staging_event_attr, &staging_event_string, OBJ_OPENIF, NULL, NULL );
+    if (NtCreateEvent( &staging_event, EVENT_ALL_ACCESS, &staging_event_attr, NotificationEvent, FALSE ) == STATUS_SUCCESS)
+    {
+        FIXME_(winediag)("wine-staging %s is a testing version containing experimental patches.\n", wine_get_version());
+        FIXME_(winediag)("Please mention your exact version when filing bug reports on winehq.org.\n");
+    }
+    else
+    {
+        WARN_(winediag)("wine-staging %s is a testing version containing experimental patches.\n", wine_get_version());
+        NtClose( staging_event );
     }
 
     NtCurrentTeb()->FlsSlots = fls_alloc_data();

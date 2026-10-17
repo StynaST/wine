@@ -107,6 +107,10 @@ struct ddraw
 
     struct ddraw_surface *primary;
     RECT primary_lock;
+    /* The visible overlay, composited over its destination when the
+     * destination is presented. */
+    struct ddraw_surface *overlay, *overlay_dst;
+    RECT overlay_src_rect, overlay_dst_rect;
     struct wined3d_texture *gdi_surface;
     struct wined3d_swapchain *wined3d_swapchain;
     struct wined3d_swapchain_state_parent state_parent;
@@ -114,6 +118,7 @@ struct ddraw
 
     /* DirectDraw things, which are not handled by WineD3D */
     DWORD                   cooperative_level;
+    LONGLONG                next_vblank_time;
 
     /* D3D things */
     HWND                    d3d_window;
@@ -343,6 +348,11 @@ struct d3d_device
     struct list viewport_list;
     struct d3d_viewport *current_viewport;
     D3DVIEWPORT7 active_viewport;
+
+    /* Pick data */
+    D3DPICKRECORD *pick_records;
+    DWORD pick_record_count;
+    DWORD pick_record_size;
 
     /* Required to keep track which of two available texture blending modes in d3ddevice3 is used */
     BOOL legacyTextureBlending;
@@ -580,7 +590,7 @@ struct d3d_execute_buffer *unsafe_impl_from_IDirect3DExecuteBuffer(IDirect3DExec
 
 /* The execute function */
 HRESULT d3d_execute_buffer_execute(struct d3d_execute_buffer *execute_buffer,
-        struct d3d_device *device);
+        struct d3d_device *device, D3DRECT *pick_rect);
 
 /*****************************************************************************
  * IDirect3DVertexBuffer

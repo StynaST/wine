@@ -116,6 +116,7 @@ struct ntdll_thread_data
     PRTL_THREAD_START_ROUTINE start;         /* thread entry point */
     void                     *param;         /* thread entry point parameter */
     void                     *jmp_buf;       /* setjmp buffer for exception handling */
+    BOOL                      system_thread; /* thread runs only on the Unix side */
     int                      *fsync_apc_futex;
 };
 
@@ -147,6 +148,7 @@ struct async_fileio
 {
     async_callback_t    *callback;
     struct async_fileio *next;
+    DWORD                size;
     HANDLE               handle;
 };
 
@@ -233,7 +235,8 @@ extern void *create_startup_info( const UNICODE_STRING *nt_image, ULONG process_
 extern char *get_alternate_wineloader( WORD machine );
 extern NTSTATUS exec_wineloader( char **argv, int socketfd, const struct pe_image_info *pe_info );
 extern NTSTATUS load_builtin( const struct pe_image_info *image_info, UNICODE_STRING *nt_name,
-                              ANSI_STRING *exp_name, USHORT machine, SECTION_IMAGE_INFORMATION *info,
+                              ANSI_STRING *exp_name, void *version_res, ULONG version_len,
+                              USHORT machine, SECTION_IMAGE_INFORMATION *info,
                               void **module, SIZE_T *size, ULONG_PTR limit_low, ULONG_PTR limit_high, off_t offset );
 extern NTSTATUS load_unixlib_by_name( const UNICODE_STRING *nt_name, void **handle_ret );
 extern BOOL is_builtin_path( const UNICODE_STRING *path, WORD *machine );
@@ -348,6 +351,7 @@ extern void signal_init_threading(void);
 extern NTSTATUS signal_alloc_thread( TEB *teb );
 extern void set_thread_teb( TEB *teb );
 extern void signal_free_thread( TEB *teb );
+extern void signal_disable_syscall_dispatch(void);
 extern void signal_init_process(void);
 extern void DECLSPEC_NORETURN signal_start_thread( PRTL_THREAD_START_ROUTINE entry, void *arg,
                                                    BOOL suspend, TEB *teb );
@@ -587,7 +591,7 @@ enum loadorder
 };
 
 extern void set_load_order_app_name( const WCHAR *app_name );
-extern enum loadorder get_load_order( const UNICODE_STRING *nt_name );
+extern enum loadorder get_load_order( const UNICODE_STRING *nt_name, void *version_res, ULONG version_len );
 
 static inline WCHAR ntdll_towupper( WCHAR ch )
 {

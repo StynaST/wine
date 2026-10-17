@@ -1,0 +1,882 @@
+/*
+ * Copyright 2009 Maarten Lankhorst
+ * Copyright 2011 Andrew Eikum for CodeWeavers
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
+#include <stdarg.h>
+#include <wchar.h>
+
+#include "ntstatus.h"
+#define COBJMACROS
+#define WIN32_NO_STATUS
+#include "windef.h"
+#include "winbase.h"
+#include "wingdi.h"
+
+#include "ole2.h"
+#include "olectl.h"
+#include "rpcproxy.h"
+#include "propsys.h"
+#include "propkeydef.h"
+#include "mmdeviceapi.h"
+#include "mmsystem.h"
+#include "dsound.h"
+#include "audioclient.h"
+#include "endpointvolume.h"
+#include "audiopolicy.h"
+#include "devpkey.h"
+#include "winreg.h"
+#include "spatialaudioclient.h"
+#include "mmddk.h"
+
+#include "mmdevapi_private.h"
+#include "wine/debug.h"
+
+WINE_DEFAULT_DEBUG_CHANNEL(mmdevapi);
+
+DriverFuncs drvs;
+static DriverFuncs midi_driver;
+
+#define MIDI_CALL(code,args)  __wine_unix_call( midi_driver.module_unixlib, code, args )
+
+const WCHAR drv_keyW[] = L"Software\\Wine\\Drivers";
+
+typedef BOOL (WINAPI *death_stranding_output_selector_t)(DWORD output_id);
+
+static death_stranding_output_selector_t death_stranding_output_selector;
+static LONG death_stranding_pending_output_id = -1;
+
+static BOOL WINAPI death_stranding_select_controller_output(DWORD output_id)
+{
+    LONG hash;
+    BOOL ret;
+
+    hash = InterlockedExchange(&death_stranding_pending_output_id, -1);
+    if (hash != -1 && (DWORD)hash != output_id)
+    {
+        TRACE("Death Stranding is priming controller output %#lx before requested output %#lx.\n",
+                hash, output_id);
+        ret = death_stranding_output_selector(hash);
+        if (!ret)
+            WARN("Death Stranding rejected controller output %#lx; preserving requested output %#lx.\n",
+                    hash, output_id);
+    }
+
+    TRACE("Death Stranding is selecting requested output %#lx through its settings path.\n", output_id);
+    return death_stranding_output_selector(output_id);
+}
+
+static const char *get_priority_string(int prio)
+{
+    switch(prio){
+    case Priority_Unavailable:
+        return "Unavailable";
+    case Priority_Low:
+        return "Low";
+    case Priority_Neutral:
+        return "Neutral";
+    case Priority_Preferred:
+        return "Preferred";
+    }
+    return "Invalid";
+}
+
+static BOOL load_driver(const WCHAR *name, DriverFuncs *driver)
+{
+    NTSTATUS status;
+    WCHAR driver_module[264], path[MAX_PATH];
+    struct test_connect_params params;
+
+    lstrcpyW(driver_module, L"wine");
+    lstrcatW(driver_module, name);
+    lstrcatW(driver_module, L".drv");
+
+    TRACE("Attempting to load %s\n", wine_dbgstr_w(driver_module));
+
+    driver->module = LoadLibraryW(driver_module);
+    if(!driver->module){
+        TRACE("Unable to load %s: %lu\n", wine_dbgstr_w(driver_module),
+                GetLastError());
+        return FALSE;
+    }
+
+    if ((status = NtQueryVirtualMemory(GetCurrentProcess(), driver->module, MemoryWineLoadUnixLib,
+        &driver->module_unixlib, sizeof(driver->module_unixlib), NULL))) {
+        ERR("Unable to load UNIX functions: %lx\n", status);
+        goto fail;
+    }
+
+    if ((status = __wine_unix_call(driver->module_unixlib, process_attach, NULL))) {
+        ERR("Unable to initialize library: %lx\n", status);
+        goto fail;
+    }
+
+    GetModuleFileNameW(NULL, path, ARRAY_SIZE(path));
+    params.name     = wcsrchr(path, '\\');
+    params.name     = params.name ? params.name + 1 : path;
+    params.priority = Priority_Neutral;
+
+    if ((status = __wine_unix_call(driver->module_unixlib, test_connect, &params))) {
+        ERR("Unable to retrieve driver priority: %lx\n", status);
+        goto fail;
+    }
+
+    driver->priority = params.priority;
+
+    lstrcpyW(driver->module_name, driver_module);
+
+    TRACE("Successfully loaded %s with priority %s\n",
+            wine_dbgstr_w(driver_module), get_priority_string(driver->priority));
+
+    return TRUE;
+fail:
+    FreeLibrary(driver->module);
+    return FALSE;
+}
+
+static BOOL enable_death_stranding_controller_effects(void)
+{
+    static const char *const callback_names[] =
+    {
+        "Wwise::sGetFootSoundToControllerSpeaker",
+        "Wwise::sGetControllerSpeakerEnable",
+    };
+    HMODULE module = GetModuleHandleW(NULL);
+    BYTE *base = (BYTE *)module;
+    BYTE *names[ARRAY_SIZE(callback_names)] = {0};
+    BYTE *references[ARRAY_SIZE(callback_names)] = {0};
+    BYTE *callbacks[ARRAY_SIZE(callback_names)] = {0};
+    IMAGE_NT_HEADERS *nt;
+    IMAGE_SECTION_HEADER *section;
+    BYTE *output_selector = NULL, *selector_call = NULL;
+    DWORD old_protect;
+    WCHAR value[2];
+    INT32 jump_offset;
+    INT_PTR relative_offset;
+    unsigned int i, k;
+
+    if (GetEnvironmentVariableW(L"PROTON_DEATH_STRANDING_CONTROLLER_EFFECTS", value, ARRAY_SIZE(value)) != 1
+            || value[0] != '1')
+        return FALSE;
+    if (!(nt = RtlImageNtHeader(module))) return FALSE;
+
+    section = IMAGE_FIRST_SECTION(nt);
+    for (k = 0; k < ARRAY_SIZE(callback_names); ++k)
+    {
+        SIZE_T name_size = strlen(callback_names[k]) + 1;
+
+        for (i = 0; i < nt->FileHeader.NumberOfSections && !names[k]; ++i)
+        {
+            BYTE *start = base + section[i].VirtualAddress;
+            SIZE_T size = section[i].Misc.VirtualSize;
+            SIZE_T j;
+
+            if (section[i].Characteristics & IMAGE_SCN_MEM_EXECUTE || size < name_size) continue;
+            for (j = 0; j <= size - name_size; ++j)
+            {
+                if (!memcmp(start + j, callback_names[k], name_size))
+                {
+                    names[k] = start + j;
+                    break;
+                }
+            }
+        }
+        if (!names[k]) return FALSE;
+    }
+
+    for (k = 0; k < ARRAY_SIZE(callback_names); ++k)
+    {
+        for (i = 0; i < nt->FileHeader.NumberOfSections && !references[k]; ++i)
+        {
+            BYTE *start = base + section[i].VirtualAddress;
+            SIZE_T size = section[i].Misc.VirtualSize;
+            SIZE_T j;
+
+            if (!(section[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) || size < 7) continue;
+            for (j = 0; j <= size - 7; ++j)
+            {
+                BYTE *p = start + j;
+                INT32 displacement;
+
+                if (p[0] != 0x4c || p[1] != 0x8d || p[2] != 0x05) continue;
+                memcpy(&displacement, p + 3, sizeof(displacement));
+                if (p + 7 + displacement == names[k])
+                {
+                    references[k] = p;
+                    break;
+                }
+            }
+        }
+        if (!references[k]) return FALSE;
+    }
+
+    for (k = 0; k < ARRAY_SIZE(callback_names); ++k)
+    {
+        BYTE *p;
+
+        for (p = references[k]; p >= references[k] - 32; --p)
+        {
+            INT32 displacement;
+            BYTE *target;
+
+            if (p[0] != 0x48 || p[1] != 0x8d || p[2] != 0x05) continue;
+            memcpy(&displacement, p + 3, sizeof(displacement));
+            target = p + 7 + displacement;
+            if (target < base || target + 11 > base + nt->OptionalHeader.SizeOfImage) continue;
+            callbacks[k] = target;
+            break;
+        }
+        if (!callbacks[k]) return FALSE;
+    }
+
+    if (callbacks[0][0] != 0x32 || callbacks[0][1] != 0xc0 || callbacks[0][2] != 0xc3
+            || callbacks[0][3] != 0xcc || callbacks[0][4] != 0xcc)
+        return FALSE;
+    if (callbacks[1][0] != 0x83 || callbacks[1][1] != 0x3d || callbacks[1][6] != 0xff
+            || callbacks[1][7] != 0x0f || callbacks[1][8] != 0x95 || callbacks[1][9] != 0xc0
+            || callbacks[1][10] != 0xc3)
+        return FALSE;
+
+    for (i = 0; i < nt->FileHeader.NumberOfSections && !selector_call; ++i)
+    {
+        BYTE *start = base + section[i].VirtualAddress;
+        SIZE_T size = section[i].Misc.VirtualSize;
+        SIZE_T j;
+
+        if (!(section[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) || size < 24) continue;
+        for (j = 0; j <= size - 24; ++j)
+        {
+            BYTE *p = start + j;
+            INT32 displacement;
+            BYTE *target;
+
+            if (p[0] != 0x8b || p[1] != 0x8b || p[2] != 0xdc ||
+                    p[3] != 0x00 || p[4] != 0x00 || p[5] != 0x00 ||
+                    p[6] != 0xc5 || p[7] != 0xf8 || p[8] != 0x77 || p[9] != 0xe8 ||
+                    p[14] != 0xc5 || p[15] != 0xf8 || p[16] != 0x77 ||
+                    p[17] != 0x48 || p[18] != 0x83 || p[19] != 0xc4 || p[20] != 0x78 ||
+                    p[21] != 0x5f || p[22] != 0x5b || p[23] != 0xc3)
+                continue;
+
+            memcpy(&displacement, p + 10, sizeof(displacement));
+            target = p + 14 + displacement;
+            if (target < base || target + 10 > base + nt->OptionalHeader.SizeOfImage ||
+                    target[0] != 0x48 || target[1] != 0x89 || target[2] != 0x5c ||
+                    target[3] != 0x24 || target[4] != 0x10 || target[5] != 0x56 ||
+                    target[6] != 0x48 || target[7] != 0x83 || target[8] != 0xec || target[9] != 0x40)
+                continue;
+
+            selector_call = p + 9;
+            output_selector = target;
+            break;
+        }
+    }
+    if (!selector_call) return FALSE;
+
+    relative_offset = (BYTE *)death_stranding_select_controller_output - (selector_call + 5);
+    jump_offset = (INT32)relative_offset;
+    if ((INT_PTR)jump_offset != relative_offset) return FALSE;
+    death_stranding_output_selector = (death_stranding_output_selector_t)output_selector;
+    if (!VirtualProtect(selector_call, 5, PAGE_EXECUTE_READWRITE, &old_protect)) return FALSE;
+    selector_call[0] = 0xe8;
+    memcpy(selector_call + 1, &jump_offset, sizeof(jump_offset));
+    FlushInstructionCache(GetCurrentProcess(), selector_call, 5);
+    VirtualProtect(selector_call, 5, old_protect, &old_protect);
+
+    TRACE("Left unsupported Death Stranding environmental speaker callback %p disabled and "
+            "redirected its settings output selector call %p through %p.\n", callbacks[0],
+            selector_call, (void *)death_stranding_select_controller_output);
+    return TRUE;
+}
+
+void death_stranding_controller_endpoint_seen(const WCHAR *id)
+{
+    const WCHAR *p;
+    DWORD hash = 0x811c9dc5;
+    if (!death_stranding_output_selector || !id) return;
+
+    for (p = id; *p; ++p)
+    {
+        WCHAR ch = *p;
+
+        if (ch >= 'A' && ch <= 'Z') ch += 'a' - 'A';
+        if (ch > 0x7f)
+        {
+            WARN("Cannot select non-ASCII Death Stranding controller endpoint %s.\n", wine_dbgstr_w(id));
+            return;
+        }
+        hash *= 0x01000193;
+        hash ^= ch;
+    }
+
+    if (hash == ~0u || (DWORD)InterlockedExchange(&death_stranding_pending_output_id, hash) == hash)
+        return;
+
+    TRACE("Queued Death Stranding controller endpoint %s (Wwise device %#lx) for its settings path.\n",
+            wine_dbgstr_w(id), hash);
+}
+
+BOOL death_stranding_controller_output_hook_active(void)
+{
+    return death_stranding_output_selector != NULL;
+}
+
+static BOOL WINAPI init_driver(INIT_ONCE *once, void *param, void **context)
+{
+    static WCHAR default_list[] = L"pulse,alsa,oss,coreaudio";
+    DriverFuncs driver;
+    HKEY key;
+    WCHAR reg_list[256], *p, *next, *driver_list = default_list;
+
+    if (GetEnvironmentVariableW(L"PROTON_DEATH_STRANDING_CONTROLLER_EFFECTS", reg_list, ARRAY_SIZE(reg_list))
+            && !enable_death_stranding_controller_effects())
+        WARN("Could not configure Death Stranding's native controller-audio output.\n");
+
+    if(RegOpenKeyW(HKEY_CURRENT_USER, drv_keyW, &key) == ERROR_SUCCESS){
+        DWORD size = sizeof(reg_list);
+
+        if(RegQueryValueExW(key, L"Audio", 0, NULL, (BYTE*)reg_list, &size) == ERROR_SUCCESS){
+            if(reg_list[0] == '\0'){
+                TRACE("User explicitly chose no driver\n");
+                RegCloseKey(key);
+                return TRUE;
+            }
+
+            driver_list = reg_list;
+        }
+
+        RegCloseKey(key);
+    }
+
+    TRACE("Loading driver list %s\n", wine_dbgstr_w(driver_list));
+    for(next = p = driver_list; next; p = next + 1){
+        next = wcschr(p, ',');
+        if(next)
+            *next = '\0';
+
+        driver.priority = Priority_Unavailable;
+        if(load_driver(p, &driver)){
+            if(driver.priority == Priority_Unavailable)
+                FreeLibrary(driver.module);
+            else if(!drvs.module || driver.priority > drvs.priority){
+                TRACE("Selecting driver %s with priority %s\n",
+                        wine_dbgstr_w(p), get_priority_string(driver.priority));
+                if(drvs.module)
+                    FreeLibrary(drvs.module);
+                drvs = driver;
+            }else
+                FreeLibrary(driver.module);
+        }else
+            TRACE("Failed to load driver %s\n", wine_dbgstr_w(p));
+
+        if(next)
+            *next = ',';
+    }
+
+    if (drvs.module != 0)
+    {
+        WCHAR midi_drvname[64];
+
+        midi_drvname[0] = 0;
+        wine_unix_call( midi_get_driver, midi_drvname );
+        if (midi_drvname[0])
+        {
+            if (load_driver( midi_drvname, &midi_driver ))
+                TRACE( "loaded %s as MIDI driver\n", debugstr_w(midi_driver.module_name) );
+            else
+               TRACE( "failed to load MIDI driver %s\n", wine_dbgstr_w(midi_drvname) );
+        }
+        else midi_driver = drvs;
+
+        load_devices_from_reg();
+        load_driver_devices(eRender);
+        load_driver_devices(eCapture);
+    }
+
+    if (drvs.module == 0)
+        ERR("No driver from %s could be initialized. "
+            "Maybe check dependencies with WINEDEBUG=warn+module.\n",
+            wine_dbgstr_w(driver_list));
+
+    return drvs.module != 0;
+}
+
+BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
+{
+    TRACE("(0x%p, %ld, %p)\n", hinstDLL, fdwReason, lpvReserved);
+
+    switch (fdwReason)
+    {
+        case DLL_PROCESS_ATTACH:
+            DisableThreadLibraryCalls(hinstDLL);
+            break;
+        case DLL_PROCESS_DETACH:
+            if (drvs.module_unixlib)
+            {
+                wine_unix_call( process_detach, NULL );
+                FreeLibrary( drvs.module );
+                if (midi_driver.module != drvs.module)
+                {
+                    MIDI_CALL( process_detach, NULL );
+                    FreeLibrary( midi_driver.module );
+                }
+            }
+            main_loop_stop();
+            stop_update_thread();
+
+            if (!lpvReserved)
+                MMDevEnum_Free();
+            break;
+    }
+
+    return TRUE;
+}
+
+typedef HRESULT (*FnCreateInstance)(REFIID riid, LPVOID *ppobj);
+
+typedef struct {
+    IClassFactory IClassFactory_iface;
+    REFCLSID rclsid;
+    FnCreateInstance pfnCreateInstance;
+} IClassFactoryImpl;
+
+static inline IClassFactoryImpl *impl_from_IClassFactory(IClassFactory *iface)
+{
+    return CONTAINING_RECORD(iface, IClassFactoryImpl, IClassFactory_iface);
+}
+
+static HRESULT WINAPI
+MMCF_QueryInterface(IClassFactory *iface, REFIID riid, void **ppobj)
+{
+    IClassFactoryImpl *This = impl_from_IClassFactory(iface);
+    TRACE("(%p, %s, %p)\n", This, debugstr_guid(riid), ppobj);
+    if (ppobj == NULL)
+        return E_POINTER;
+    if (IsEqualIID(riid, &IID_IUnknown) ||
+        IsEqualIID(riid, &IID_IClassFactory))
+    {
+        *ppobj = iface;
+        IClassFactory_AddRef(iface);
+        return S_OK;
+    }
+    *ppobj = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG WINAPI MMCF_AddRef(LPCLASSFACTORY iface)
+{
+    return 2;
+}
+
+static ULONG WINAPI MMCF_Release(LPCLASSFACTORY iface)
+{
+    /* static class, won't be freed */
+    return 1;
+}
+
+static HRESULT WINAPI MMCF_CreateInstance(
+    LPCLASSFACTORY iface,
+    LPUNKNOWN pOuter,
+    REFIID riid,
+    LPVOID *ppobj)
+{
+    IClassFactoryImpl *This = impl_from_IClassFactory(iface);
+    TRACE("(%p, %p, %s, %p)\n", This, pOuter, debugstr_guid(riid), ppobj);
+
+    if (pOuter)
+        return CLASS_E_NOAGGREGATION;
+
+    if (ppobj == NULL) {
+        WARN("invalid parameter\n");
+        return E_POINTER;
+    }
+    *ppobj = NULL;
+    return This->pfnCreateInstance(riid, ppobj);
+}
+
+static HRESULT WINAPI MMCF_LockServer(LPCLASSFACTORY iface, BOOL dolock)
+{
+    IClassFactoryImpl *This = impl_from_IClassFactory(iface);
+    FIXME("(%p, %d) stub!\n", This, dolock);
+    return S_OK;
+}
+
+static const IClassFactoryVtbl MMCF_Vtbl = {
+    MMCF_QueryInterface,
+    MMCF_AddRef,
+    MMCF_Release,
+    MMCF_CreateInstance,
+    MMCF_LockServer
+};
+
+static IClassFactoryImpl MMDEVAPI_CF[] = {
+    { { &MMCF_Vtbl }, &CLSID_MMDeviceEnumerator, (FnCreateInstance)MMDevEnum_Create }
+};
+
+static INIT_ONCE init_once = INIT_ONCE_STATIC_INIT;
+static HANDLE notify_thread_handle;
+
+HRESULT WINAPI DllGetClassObject(REFCLSID rclsid, REFIID riid, LPVOID *ppv)
+{
+    unsigned int i = 0;
+    TRACE("(%s, %s, %p)\n", debugstr_guid(rclsid), debugstr_guid(riid), ppv);
+
+    InitOnceExecuteOnce(&init_once, init_driver, NULL, NULL);
+
+    if (ppv == NULL) {
+        WARN("invalid parameter\n");
+        return E_INVALIDARG;
+    }
+
+    *ppv = NULL;
+
+    if (!IsEqualIID(riid, &IID_IClassFactory) &&
+        !IsEqualIID(riid, &IID_IUnknown)) {
+        WARN("no interface for %s\n", debugstr_guid(riid));
+        return E_NOINTERFACE;
+    }
+
+    for (i = 0; i < ARRAY_SIZE(MMDEVAPI_CF); ++i)
+    {
+        if (IsEqualGUID(rclsid, MMDEVAPI_CF[i].rclsid)) {
+            IClassFactory_AddRef(&MMDEVAPI_CF[i].IClassFactory_iface);
+            *ppv = &MMDEVAPI_CF[i];
+            return S_OK;
+        }
+    }
+
+    WARN("(%s, %s, %p): no class found.\n", debugstr_guid(rclsid),
+         debugstr_guid(riid), ppv);
+    return CLASS_E_CLASSNOTAVAILABLE;
+}
+
+static void notify_client(struct notify_context *notify)
+{
+    TRACE( "dev %u msg %x param1 %Ix param2 %0Ix\n",
+           notify->dev_id, notify->msg, notify->param_1, notify->param_2);
+
+    DriverCallback( notify->callback, notify->flags, notify->device, notify->msg,
+                    notify->instance, notify->param_1, notify->param_2 );
+}
+
+static DWORD WINAPI notify_thread( void *p )
+{
+    struct midi_notify_wait_params params;
+    struct notify_context notify;
+    BOOL quit;
+
+    SetThreadDescription( GetCurrentThread(), L"mmdevapi_midi_notify" );
+    params.notify = &notify;
+    params.quit = &quit;
+
+    while (1)
+    {
+        MIDI_CALL( midi_notify_wait, &params );
+        if (quit) break;
+        if (notify.send_notify) notify_client(&notify);
+    }
+    return 0;
+}
+
+LRESULT WINAPI DriverProc( DWORD_PTR id, HANDLE driver, UINT msg, LPARAM param1, LPARAM param2 )
+{
+    InitOnceExecuteOnce( &init_once, init_driver, NULL, NULL );
+    if (!midi_driver.module_unixlib) return 0;
+
+    switch(msg)
+    {
+    case DRV_LOAD:
+    {
+        struct midi_init_params params;
+        UINT err = DRV_SUCCESS;
+
+        params.err = &err;
+        MIDI_CALL( midi_init, &params );
+        if (err == DRV_SUCCESS) notify_thread_handle = CreateThread( NULL, 0, notify_thread, NULL, 0, NULL );
+        return err;
+    }
+    case DRV_FREE:
+        MIDI_CALL( midi_release, NULL );
+        WaitForSingleObject( notify_thread_handle, INFINITE );
+        CloseHandle( notify_thread_handle );
+        notify_thread_handle = NULL;
+        return 1;
+    case DRV_OPEN:
+    case DRV_CLOSE:
+    case DRV_QUERYCONFIGURE:
+    case DRV_CONFIGURE:
+        return 1;
+    }
+    return DefDriverProc( id, driver, msg, param1, param2 );
+}
+
+DWORD WINAPI midMessage( UINT id, UINT msg, DWORD_PTR user, DWORD_PTR param1, DWORD_PTR param2 )
+{
+    struct midi_in_message_params params;
+    struct notify_context notify;
+    UINT err = 0;
+
+    TRACE( "%04x %04x %08Ix %08Ix %08Ix\n", id, msg, user, param1, param2 );
+
+    params.dev_id  = id;
+    params.msg     = msg;
+    params.user    = user;
+    params.param_1 = param1;
+    params.param_2 = param2;
+    params.err     = &err;
+    params.notify  = &notify;
+
+    do
+    {
+        MIDI_CALL( midi_in_message, &params );
+        if ((!err || err == ERROR_RETRY) && notify.send_notify) notify_client( &notify );
+    } while (err == ERROR_RETRY);
+
+    return err;
+}
+
+DWORD WINAPI modMessage( UINT id, UINT msg, DWORD_PTR user, DWORD_PTR param1, DWORD_PTR param2 )
+{
+    struct midi_out_message_params params;
+    struct notify_context notify;
+    UINT err = 0;
+
+    TRACE( "%04x %04x %08Ix %08Ix %08Ix\n", id, msg, user, param1, param2 );
+
+    params.dev_id  = id;
+    params.msg     = msg;
+    params.user    = user;
+    params.param_1 = param1;
+    params.param_2 = param2;
+    params.err     = &err;
+    params.notify  = &notify;
+
+    MIDI_CALL( midi_out_message, &params );
+    if (!err && notify.send_notify) notify_client( &notify );
+    return err;
+}
+
+DWORD WINAPI auxMessage( UINT id, UINT msg, DWORD_PTR user, DWORD_PTR param1, DWORD_PTR param2 )
+{
+    struct aux_message_params params;
+    UINT err = 0;
+
+    TRACE( "%04x %04x %08Ix %08Ix %08Ix\n", id, msg, user, param1, param2 );
+
+    params.dev_id  = id;
+    params.msg     = msg;
+    params.user    = user;
+    params.param_1 = param1;
+    params.param_2 = param2;
+    params.err     = &err;
+    wine_unix_call( aux_message, &params );
+    return err;
+}
+
+struct activate_async_op {
+    IActivateAudioInterfaceAsyncOperation IActivateAudioInterfaceAsyncOperation_iface;
+    LONG ref;
+
+    IActivateAudioInterfaceCompletionHandler *callback;
+    HRESULT result_hr;
+    IUnknown *result_iface;
+};
+
+static struct activate_async_op *impl_from_IActivateAudioInterfaceAsyncOperation(IActivateAudioInterfaceAsyncOperation *iface)
+{
+    return CONTAINING_RECORD(iface, struct activate_async_op, IActivateAudioInterfaceAsyncOperation_iface);
+}
+
+static HRESULT WINAPI activate_async_op_QueryInterface(IActivateAudioInterfaceAsyncOperation *iface,
+        REFIID riid, void **ppv)
+{
+    struct activate_async_op *This = impl_from_IActivateAudioInterfaceAsyncOperation(iface);
+
+    TRACE("(%p)->(%s, %p)\n", This, debugstr_guid(riid), ppv);
+
+    if (!ppv)
+        return E_POINTER;
+
+    if (IsEqualIID(riid, &IID_IUnknown) ||
+            IsEqualIID(riid, &IID_IActivateAudioInterfaceAsyncOperation)) {
+        *ppv = &This->IActivateAudioInterfaceAsyncOperation_iface;
+    } else {
+        *ppv = NULL;
+        return E_NOINTERFACE;
+    }
+
+    IUnknown_AddRef((IUnknown*)*ppv);
+    return S_OK;
+}
+
+static ULONG WINAPI activate_async_op_AddRef(IActivateAudioInterfaceAsyncOperation *iface)
+{
+    struct activate_async_op *This = impl_from_IActivateAudioInterfaceAsyncOperation(iface);
+    LONG ref = InterlockedIncrement(&This->ref);
+    TRACE("(%p) refcount now %li\n", This, ref);
+    return ref;
+}
+
+static ULONG WINAPI activate_async_op_Release(IActivateAudioInterfaceAsyncOperation *iface)
+{
+    struct activate_async_op *This = impl_from_IActivateAudioInterfaceAsyncOperation(iface);
+    LONG ref = InterlockedDecrement(&This->ref);
+    TRACE("(%p) refcount now %li\n", This, ref);
+    if (!ref) {
+        if(This->result_iface)
+            IUnknown_Release(This->result_iface);
+        IActivateAudioInterfaceCompletionHandler_Release(This->callback);
+        free(This);
+    }
+    return ref;
+}
+
+static HRESULT WINAPI activate_async_op_GetActivateResult(IActivateAudioInterfaceAsyncOperation *iface,
+        HRESULT *result_hr, IUnknown **result_iface)
+{
+    struct activate_async_op *This = impl_from_IActivateAudioInterfaceAsyncOperation(iface);
+
+    TRACE("(%p)->(%p, %p)\n", This, result_hr, result_iface);
+
+    *result_hr = This->result_hr;
+
+    if(This->result_hr == S_OK){
+        *result_iface = This->result_iface;
+        IUnknown_AddRef(*result_iface);
+    }
+
+    return S_OK;
+}
+
+static IActivateAudioInterfaceAsyncOperationVtbl IActivateAudioInterfaceAsyncOperation_vtbl = {
+    activate_async_op_QueryInterface,
+    activate_async_op_AddRef,
+    activate_async_op_Release,
+    activate_async_op_GetActivateResult,
+};
+
+static DWORD WINAPI activate_async_threadproc(void *user)
+{
+    struct activate_async_op *op = user;
+
+    SetThreadDescription(GetCurrentThread(), L"wine_mmdevapi_activate_async");
+
+    IActivateAudioInterfaceCompletionHandler_ActivateCompleted(op->callback, &op->IActivateAudioInterfaceAsyncOperation_iface);
+
+    IActivateAudioInterfaceAsyncOperation_Release(&op->IActivateAudioInterfaceAsyncOperation_iface);
+
+    return 0;
+}
+
+#define MMDEV_ID_FLOW_IDX 5
+/* strlen("{0.0.1.00000000}.{fd47d9cc-4218-4135-9ce2-0c195c87405b}") + 1 */
+#define MMDEV_ID_LEN 56
+/* ARRAY_SIZE(MMDEV_PATH_PREFIX) */
+#define MMDEV_PREFIX_LEN 18
+/* (MMDEV_PREFIX_LEN - 1) + (MMDEV_ID_LEN - 1) + 1 + (ARRAY_SIZE(DEVINTERFACE_AUDIO_RENDER_WSTR) - 1) + 1 */
+#define MMDEV_PATH_LEN 112
+static HRESULT get_mmdevice_by_activatepath(const WCHAR *path, IMMDevice **mmdev)
+{
+    IMMDeviceEnumerator *devenum;
+    HRESULT hr;
+
+    static const WCHAR DEVINTERFACE_AUDIO_RENDER_WSTR[] = L"{E6327CAD-DCEC-4949-AE8A-991E976A79D2}";
+    static const WCHAR DEVINTERFACE_AUDIO_CAPTURE_WSTR[] = L"{2EEF81BE-33FA-4800-9670-1CD474972C3F}";
+    static const WCHAR MMDEV_PATH_PREFIX[] = L"\\\\?\\SWD#MMDEVAPI#";
+
+    hr = MMDevEnum_Create(&IID_IMMDeviceEnumerator, (void**)&devenum);
+    if (FAILED(hr)) {
+        WARN("Failed to create MMDeviceEnumerator: %08lx\n", hr);
+        return hr;
+    }
+
+    if (!lstrcmpiW(path, DEVINTERFACE_AUDIO_RENDER_WSTR)) {
+        hr = IMMDeviceEnumerator_GetDefaultAudioEndpoint(devenum, eRender, eMultimedia, mmdev);
+    } else if (!lstrcmpiW(path, DEVINTERFACE_AUDIO_CAPTURE_WSTR)) {
+        hr = IMMDeviceEnumerator_GetDefaultAudioEndpoint(devenum, eCapture, eMultimedia, mmdev);
+    } else if (wcslen(path) == MMDEV_PATH_LEN - 1) {
+        WCHAR path_prefix[MMDEV_PREFIX_LEN];
+        memcpy(path_prefix, path, (MMDEV_PREFIX_LEN - 1) * sizeof(WCHAR));
+        path_prefix[MMDEV_PREFIX_LEN - 1] = 0;
+
+        if (
+            !lstrcmpiW(path_prefix, MMDEV_PATH_PREFIX) &&
+            path[(MMDEV_PREFIX_LEN - 1) + (MMDEV_ID_LEN - 1)] == L'#'
+        ) {
+            const WCHAR *path_suffix = path + (MMDEV_PREFIX_LEN - 1) + (MMDEV_ID_LEN - 1) + 1;
+            WCHAR device_id[MMDEV_ID_LEN];
+            lstrcpynW(device_id, path + (MMDEV_PREFIX_LEN - 1), MMDEV_ID_LEN);
+
+            if (
+                (device_id[MMDEV_ID_FLOW_IDX] == L'0' && !lstrcmpiW(path_suffix, DEVINTERFACE_AUDIO_RENDER_WSTR)) ||
+                (device_id[MMDEV_ID_FLOW_IDX] == L'1' && !lstrcmpiW(path_suffix, DEVINTERFACE_AUDIO_CAPTURE_WSTR))
+            )
+                hr = IMMDeviceEnumerator_GetDevice(devenum, device_id, mmdev);
+        }
+    } else {
+        FIXME("Unrecognized device id format: %s\n", debugstr_w(path));
+        hr = HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+    }
+
+    if (FAILED(hr)) {
+        WARN("Failed to get requested device (%s): %08lx\n", debugstr_w(path), hr);
+        *mmdev = NULL;
+        hr = HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+    }
+
+    IMMDeviceEnumerator_Release(devenum);
+
+    return hr;
+}
+
+/***********************************************************************
+ *		ActivateAudioInterfaceAsync (MMDEVAPI.17)
+ */
+HRESULT WINAPI ActivateAudioInterfaceAsync(const WCHAR *path, REFIID riid,
+        PROPVARIANT *params, IActivateAudioInterfaceCompletionHandler *done_handler,
+        IActivateAudioInterfaceAsyncOperation **op_out)
+{
+    struct activate_async_op *op;
+    HANDLE ht;
+    IMMDevice *mmdev;
+
+    TRACE("(%s, %s, %p, %p, %p)\n", debugstr_w(path), debugstr_guid(riid),
+            params, done_handler, op_out);
+
+    op = malloc(sizeof(*op));
+    if (!op)
+        return E_OUTOFMEMORY;
+
+    op->ref = 2; /* returned ref and threadproc ref */
+    op->IActivateAudioInterfaceAsyncOperation_iface.lpVtbl = &IActivateAudioInterfaceAsyncOperation_vtbl;
+    op->callback = done_handler;
+    IActivateAudioInterfaceCompletionHandler_AddRef(done_handler);
+
+    op->result_hr = get_mmdevice_by_activatepath(path, &mmdev);
+    if (SUCCEEDED(op->result_hr)) {
+        op->result_hr = IMMDevice_Activate(mmdev, riid, CLSCTX_INPROC_SERVER, params, (void**)&op->result_iface);
+        IMMDevice_Release(mmdev);
+    }else
+        op->result_iface = NULL;
+
+    ht = CreateThread(NULL, 0, &activate_async_threadproc, op, 0, NULL);
+    CloseHandle(ht);
+
+    *op_out = &op->IActivateAudioInterfaceAsyncOperation_iface;
+
+    return S_OK;
+}

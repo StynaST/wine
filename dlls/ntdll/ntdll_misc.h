@@ -87,6 +87,7 @@ extern void set_native_thread_name( DWORD tid, const char *name );
 
 /* init routines */
 extern void loader_init( CONTEXT *context, void **entry );
+extern void terminate_process_on_shutdown(void);
 extern void version_init(void);
 extern void debug_init(void);
 extern void actctx_init(void);
@@ -117,6 +118,11 @@ static inline void *get_rva( HMODULE module, DWORD va )
 {
     return (void *)((char *)module + va);
 }
+
+/* version */
+extern const char * CDECL wine_get_version(void);
+extern const char * CDECL wine_get_build_id(void);
+extern void CDECL wine_get_host_version( const char **sysname, const char **release );
 
 /* convert from straight ASCII to Unicode without depending on the current codepage */
 static inline void ascii_to_unicode( WCHAR *dst, const char *src, size_t len )
