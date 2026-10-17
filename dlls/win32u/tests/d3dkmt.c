@@ -700,6 +700,70 @@ static void test_D3DKMTOpenAdapterFromHdc(void)
     }
 }
 
+static void test_D3DKMTQueryStatistics(void)
+{
+    D3DKMT_OPENADAPTERFROMGDIDISPLAYNAME open_adapter_desc;
+    D3DKMT_QUERYADAPTERINFO query_adapter_info;
+    D3DKMT_CLOSEADAPTER close_adapter_desc;
+    D3DKMT_ADAPTER_PERFDATA perf;
+    D3DKMT_QUERYSTATISTICS stats;
+    LONGLONG running_time;
+    NTSTATUS status;
+    BOOL ret;
+
+    ret = get_primary_adapter_name( open_adapter_desc.DeviceName );
+    ok( ret, "Failed to get primary adapter name.\n" );
+    status = D3DKMTOpenAdapterFromGdiDisplayName( &open_adapter_desc );
+    ok( status == STATUS_SUCCESS, "Got unexpected return code %#lx.\n", status );
+
+    memset( &stats, 0, sizeof(stats) );
+    stats.Type = D3DKMT_QUERYSTATISTICS_ADAPTER;
+    stats.AdapterLuid = open_adapter_desc.AdapterLuid;
+    status = D3DKMTQueryStatistics( &stats );
+    ok( status == STATUS_SUCCESS, "Got unexpected return code %#lx.\n", status );
+    ok( stats.QueryResult.AdapterInformation.NodeCount >= 1, "got %lu nodes.\n",
+        stats.QueryResult.AdapterInformation.NodeCount );
+    ok( stats.QueryResult.AdapterInformation.NbSegments >= 1, "got %lu segments.\n",
+        stats.QueryResult.AdapterInformation.NbSegments );
+
+    memset( &stats, 0, sizeof(stats) );
+    stats.Type = D3DKMT_QUERYSTATISTICS_NODE;
+    stats.AdapterLuid = open_adapter_desc.AdapterLuid;
+    stats.QueryNode.NodeId = 0;
+    status = D3DKMTQueryStatistics( &stats );
+    ok( status == STATUS_SUCCESS, "Got unexpected return code %#lx.\n", status );
+    running_time = stats.QueryResult.NodeInformation.GlobalInformation.RunningTime.QuadPart;
+    Sleep( 50 );
+    status = D3DKMTQueryStatistics( &stats );
+    ok( status == STATUS_SUCCESS, "Got unexpected return code %#lx.\n", status );
+    ok( stats.QueryResult.NodeInformation.GlobalInformation.RunningTime.QuadPart >= running_time,
+        "running time went backwards.\n" );
+
+    memset( &stats, 0, sizeof(stats) );
+    stats.Type = D3DKMT_QUERYSTATISTICS_SEGMENT;
+    stats.AdapterLuid = open_adapter_desc.AdapterLuid;
+    stats.QuerySegment.SegmentId = 0;
+    status = D3DKMTQueryStatistics( &stats );
+    ok( status == STATUS_SUCCESS, "Got unexpected return code %#lx.\n", status );
+    ok( stats.QueryResult.SegmentInformation.BytesResident <= stats.QueryResult.SegmentInformation.CommitLimit ||
+        !stats.QueryResult.SegmentInformation.CommitLimit, "resident %I64u above limit %I64u.\n",
+        stats.QueryResult.SegmentInformation.BytesResident, stats.QueryResult.SegmentInformation.CommitLimit );
+
+    /* temperature is optional, drivers may not report it */
+    memset( &perf, 0, sizeof(perf) );
+    query_adapter_info.hAdapter = open_adapter_desc.hAdapter;
+    query_adapter_info.Type = KMTQAITYPE_ADAPTERPERFDATA;
+    query_adapter_info.pPrivateDriverData = &perf;
+    query_adapter_info.PrivateDriverDataSize = sizeof(perf);
+    status = D3DKMTQueryAdapterInfo( &query_adapter_info );
+    ok( status == STATUS_SUCCESS || status == STATUS_NOT_SUPPORTED, "Got unexpected return code %#lx.\n", status );
+    if (!status) ok( perf.Temperature < 1500, "got temperature %lu.\n", perf.Temperature );
+
+    close_adapter_desc.hAdapter = open_adapter_desc.hAdapter;
+    status = D3DKMTCloseAdapter( &close_adapter_desc );
+    ok( status == STATUS_SUCCESS, "Got unexpected return code %#lx.\n", status );
+}
+
 static void test_D3DKMTEnumAdapters2(void)
 {
     D3DKMT_ENUMADAPTERS2 enum_adapters_2_desc = {0};
@@ -6771,6 +6835,7 @@ START_TEST( d3dkmt )
     test_D3DKMTCheckOcclusion();
     test_D3DKMTOpenAdapterFromDeviceName();
     test_D3DKMTQueryAdapterInfo();
+    test_D3DKMTQueryStatistics();
     test_D3DKMTQueryVideoMemoryInfo();
     test_gpu_device_properties();
     test_D3DKMTCreateSynchronizationObject();

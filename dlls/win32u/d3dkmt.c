@@ -169,6 +169,7 @@ struct d3dkmt_adapter
 {
     struct d3dkmt_object obj;
     struct vulkan_physical_device *physical_device;
+    LUID luid;
 };
 
 struct d3dkmt_device
@@ -624,6 +625,21 @@ static struct vulkan_physical_device *get_vulkan_physical_device( struct vulkan_
     return NULL;
 }
 
+static BOOL get_luid_gpu_stats( const LUID *luid, struct gpu_stats *stats )
+{
+    VkPhysicalDeviceProperties2 properties2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    struct vulkan_physical_device *physical_device;
+    struct vulkan_instance *instance;
+    GUID uuid;
+
+    if (!get_gpu_uuid_from_luid( luid, &uuid )) return FALSE;
+    if (!(instance = get_d3dkmt_vulkan_instance())) return FALSE;
+    if (!(physical_device = get_vulkan_physical_device( instance, luid ))) return FALSE;
+
+    instance->p_vkGetPhysicalDeviceProperties2KHR( physical_device->host.physical_device, &properties2 );
+    return get_gpu_stats( &uuid, properties2.properties.vendorID, properties2.properties.deviceID, stats );
+}
+
 /******************************************************************************
  *           NtGdiDdDDIOpenAdapterFromLuid    (win32u.@)
  */
@@ -636,6 +652,7 @@ NTSTATUS WINAPI NtGdiDdDDIOpenAdapterFromLuid( D3DKMT_OPENADAPTERFROMLUID *desc 
     if ((status = d3dkmt_object_alloc( sizeof(*adapter), D3DKMT_ADAPTER, (void **)&adapter ))) return status;
     if ((status = alloc_object_handle( &adapter->obj ))) goto failed;
 
+    adapter->luid = desc->AdapterLuid;
     if (!(instance = get_d3dkmt_vulkan_instance())) WARN( "Vulkan is unavailable.\n" );
     else adapter->physical_device = get_vulkan_physical_device( instance, &desc->AdapterLuid );
     if (!adapter->physical_device) WARN( "Failed to find Vulkan physical device\n" );
@@ -996,6 +1013,28 @@ NTSTATUS WINAPI NtGdiDdDDIQueryAdapterInfo( D3DKMT_QUERYADAPTERINFO *desc )
 
         return STATUS_SUCCESS;
     }
+    case KMTQAITYPE_ADAPTERPERFDATA:
+    {
+        D3DKMT_ADAPTER_PERFDATA *perf = desc->pPrivateDriverData;
+        struct gpu_stats stats;
+
+        if (desc->PrivateDriverDataSize < sizeof(*perf)) return STATUS_INVALID_PARAMETER;
+        if (!(adapter = get_d3dkmt_object( desc->hAdapter, D3DKMT_ADAPTER ))) return STATUS_INVALID_PARAMETER;
+        if (perf->PhysicalAdapterIndex) return STATUS_INVALID_PARAMETER;
+        if (!get_luid_gpu_stats( &adapter->luid, &stats ) || !(stats.flags & GPU_STATS_TEMPERATURE))
+            return STATUS_NOT_SUPPORTED;
+
+        perf->MemoryFrequency      = stats.memory_frequency;
+        perf->MaxMemoryFrequency   = stats.max_memory_frequency;
+        perf->MaxMemoryFrequencyOC = stats.max_memory_frequency;
+        perf->MemoryBandwidth      = 0;
+        perf->PCIEBandwidth        = 0;
+        perf->FanRPM               = stats.fan_rpm;
+        perf->Power                = stats.power;
+        perf->Temperature          = stats.temperature;
+        perf->PowerStateOverride   = 0;
+        return STATUS_SUCCESS;
+    }
     case KMTQAITYPE_UMOPENGLINFO:
     {
         static const WCHAR opengl_dll[] = {'o','p','e','n','g','l','3','2','.','d','l','l',0};
@@ -1025,8 +1064,46 @@ NTSTATUS WINAPI NtGdiDdDDIQueryAdapterInfo( D3DKMT_QUERYADAPTERINFO *desc )
  */
 NTSTATUS WINAPI NtGdiDdDDIQueryStatistics( D3DKMT_QUERYSTATISTICS *stats )
 {
-    FIXME( "(%p): stub\n", stats );
-    return STATUS_SUCCESS;
+    struct gpu_stats gpu;
+    GUID uuid;
+
+    TRACE( "(%p)\n", stats );
+
+    if (!stats) return STATUS_INVALID_PARAMETER;
+    if (!get_gpu_uuid_from_luid( &stats->AdapterLuid, &uuid )) return STATUS_INVALID_PARAMETER;
+
+    memset( &stats->QueryResult, 0, sizeof(stats->QueryResult) );
+
+    switch (stats->Type)
+    {
+    case D3DKMT_QUERYSTATISTICS_ADAPTER:
+        stats->QueryResult.AdapterInformation.NbSegments = 1;
+        stats->QueryResult.AdapterInformation.NodeCount = 1;
+        stats->QueryResult.AdapterInformation.VidPnSourceCount = 1;
+        return STATUS_SUCCESS;
+
+    case D3DKMT_QUERYSTATISTICS_NODE:
+        if (stats->QueryNode.NodeId) return STATUS_INVALID_PARAMETER;
+        /* system-wide 3D engine running time */
+        if (get_luid_gpu_stats( &stats->AdapterLuid, &gpu ) && (gpu.flags & GPU_STATS_RUNNING_TIME))
+            stats->QueryResult.NodeInformation.GlobalInformation.RunningTime.QuadPart = gpu.running_time;
+        return STATUS_SUCCESS;
+
+    case D3DKMT_QUERYSTATISTICS_SEGMENT:
+        if (stats->QuerySegment.SegmentId) return STATUS_INVALID_PARAMETER;
+        /* dedicated video memory, used by all processes */
+        if (get_luid_gpu_stats( &stats->AdapterLuid, &gpu ) && (gpu.flags & GPU_STATS_MEMORY))
+        {
+            stats->QueryResult.SegmentInformation.CommitLimit = gpu.vram_total;
+            stats->QueryResult.SegmentInformation.BytesCommitted = gpu.vram_used;
+            stats->QueryResult.SegmentInformation.BytesResident = gpu.vram_used;
+        }
+        return STATUS_SUCCESS;
+
+    default:
+        FIXME( "type %d not implemented.\n", stats->Type );
+        return STATUS_SUCCESS;
+    }
 }
 
 /******************************************************************************

@@ -201,6 +201,27 @@ extern void user_lock(void);
 extern void user_unlock(void);
 extern void user_check_not_lock(void);
 extern BOOL get_gpu_uuid_from_luid( const LUID *luid, GUID *uuid );
+
+/* gpustats.c */
+#define GPU_STATS_RUNNING_TIME  0x1
+#define GPU_STATS_MEMORY        0x2
+#define GPU_STATS_TEMPERATURE   0x4
+
+struct gpu_stats
+{
+    UINT      flags;
+    ULONGLONG running_time;         /* 3D engine busy time, in 100ns units */
+    ULONGLONG vram_used;
+    ULONGLONG vram_total;
+    UINT      temperature;          /* deci-Celsius */
+    UINT      fan_rpm;
+    UINT      fan_percent;
+    UINT      power;                /* tenths of a percent of the power limit */
+    ULONGLONG memory_frequency;     /* Hz */
+    ULONGLONG max_memory_frequency; /* Hz */
+};
+
+extern BOOL get_gpu_stats( const GUID *uuid, UINT vendor, UINT device, struct gpu_stats *stats );
 extern BOOL get_gpu_info_from_uuid( const GUID *uuid, LUID *luid, UINT32 *node_mask, char *name );
 extern BOOL get_float_gamma_ramp( float *ramp, LONG *serial );
 extern BOOL get_global_gamma_ramp( void *data );

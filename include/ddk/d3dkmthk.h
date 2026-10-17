@@ -280,6 +280,30 @@ typedef enum _KMTQUERYADAPTERINFOTYPE
     KMTQAITYPE_WDDM_3_1_CAPS
 } KMTQUERYADAPTERINFOTYPE;
 
+typedef struct _D3DKMT_ADAPTER_PERFDATA
+{
+    UINT32    PhysicalAdapterIndex;
+    ULONGLONG MemoryFrequency;
+    ULONGLONG MaxMemoryFrequency;
+    ULONGLONG MaxMemoryFrequencyOC;
+    ULONGLONG MemoryBandwidth;
+    ULONGLONG PCIEBandwidth;
+    ULONG     FanRPM;
+    ULONG     Power;
+    ULONG     Temperature;
+    UCHAR     PowerStateOverride;
+} D3DKMT_ADAPTER_PERFDATA;
+
+typedef struct _D3DKMT_ADAPTER_PERFDATACAPS
+{
+    UINT32    PhysicalAdapterIndex;
+    ULONGLONG MaxMemoryBandwidth;
+    ULONGLONG MaxPCIEBandwidth;
+    ULONG     MaxFanRPM;
+    ULONG     TemperatureMax;
+    ULONG     TemperatureWarning;
+} D3DKMT_ADAPTER_PERFDATACAPS;
+
 typedef struct _D3DKMT_QUERYADAPTERINFO
 {
     D3DKMT_HANDLE           hAdapter;
